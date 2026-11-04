@@ -1,13 +1,21 @@
 from django.db.models import Min, Q, Count
-from rest_framework import generics, status
+from django.shortcuts import get_object_or_404
+from django.utils import timezone
+from rest_framework import generics, status, permissions
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework.pagination import PageNumberPagination
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework.filters import SearchFilter, OrderingFilter
 
-from .models import Movie, Booking, RecentlyViewedMovie, Genre, Language, Theater
-from .serializers import MovieListSerializer, GenreSerializer, LanguageSerializer
+from .models import (
+    Movie, Booking, RecentlyViewedMovie, Genre,
+    Language, Theater, Review
+)
+from .serializers import (
+    MovieListSerializer, MovieDetailSerializer,
+    GenreSerializer, LanguageSerializer, ReviewSerializer
+)
 from .filters import MovieDiscoveryFilter
 
 
@@ -68,14 +76,12 @@ class RecommendedMoviesView(APIView):
         )
 
         if not user.is_authenticated:
-            # Fallback for anonymous users: Top rated & popular
             recommended = base_qs.order_by('-total_bookings_count', '-average_rating')[:8]
             return Response({
                 'strategy': 'popular_fallback',
                 'results': MovieListSerializer(recommended, many=True).data
             })
 
-        # 1. Extract movie IDs from user's confirmed bookings and recently viewed history
         booked_movie_ids = list(
             Booking.objects.filter(user=user, status='CONFIRMED')
             .values_list('showtime__movie_id', flat=True)
@@ -93,11 +99,9 @@ class RecommendedMoviesView(APIView):
                 'results': MovieListSerializer(recommended, many=True).data
             })
 
-        # 2. Find preferred genres and languages from interacted movies in a single query
         preferred_genres = Genre.objects.filter(movies__id__in=interacted_movie_ids).values_list('id', flat=True)
         preferred_languages = Language.objects.filter(movies__id__in=interacted_movie_ids).values_list('id', flat=True)
 
-        # 3. Recommend unseen movies matching preferred genres/languages, ranked by relevance & popularity
         recommended = (
             base_qs.filter(
                 Q(genres__id__in=preferred_genres) | Q(languages__id__in=preferred_languages)
@@ -115,7 +119,7 @@ class RecommendedMoviesView(APIView):
 
 
 class FilterMetadataView(APIView):
-    """Returns available genres, languages, and cities to populate frontend filter dropdowns."""
+    """Returns available genres, languages, cities, and theaters to populate frontend filter dropdowns."""
     def get(self, request):
         genres = GenreSerializer(Genre.objects.all(), many=True).data
         languages = LanguageSerializer(Language.objects.all(), many=True).data
@@ -127,3 +131,101 @@ class FilterMetadataView(APIView):
             'cities': cities,
             'theaters': theaters,
         })
+
+
+class MovieDetailView(generics.RetrieveAPIView):
+    """
+    Task 3: Movie Details with secure YouTube embed, multiple posters, cast,
+    show schedules, verified reviews, similar movies, trending & new releases.
+    Also records RecentlyViewedMovie for Task 1 recommendations.
+    """
+    serializer_class = MovieDetailSerializer
+    queryset = Movie.objects.prefetch_related(
+        'genres', 'languages', 'cast', 'posters',
+        'showtimes__screen__theater', 'reviews__user'
+    )
+
+    def retrieve(self, request, *args, **kwargs):
+        instance = self.get_object()
+        if request.user.is_authenticated:
+            RecentlyViewedMovie.objects.update_or_create(
+                user=request.user,
+                movie=instance,
+                defaults={'viewed_at': timezone.now()}
+            )
+        serializer = self.get_serializer(instance)
+        return Response(serializer.data)
+
+
+class MovieReviewCreateUpdateView(APIView):
+    permission_classes = [permissions.IsAuthenticatedOrReadOnly]
+
+    def get(self, request, movie_id):
+        reviews = Review.objects.filter(movie_id=movie_id, is_reported=False).select_related('user').order_by('-created_at')
+        return Response(ReviewSerializer(reviews, many=True).data)
+
+    def post(self, request, movie_id):
+        movie = get_object_or_404(Movie, id=movie_id)
+
+        has_watched = Booking.objects.filter(
+            user=request.user,
+            showtime__movie=movie,
+            status='CONFIRMED',
+            showtime__start_time__lte=timezone.now()
+        ).exists()
+
+        if not has_watched:
+            return Response(
+                {
+                    "detail": "Verified Viewer Policy: You can only submit a review after booking and watching this movie."
+                },
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        if Review.objects.filter(user=request.user, movie=movie).exists():
+            return Response(
+                {"detail": "You have already reviewed this movie. Use PUT/PATCH to edit your review."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        serializer = ReviewSerializer(data=request.data)
+        if serializer.is_valid():
+            serializer.save(
+                user=request.user,
+                movie=movie,
+                is_verified_viewer=True
+            )
+            movie.update_average_rating()
+            return Response(serializer.data, status=status.HTTP_201_CREATED)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    def put(self, request, movie_id):
+        movie = get_object_or_404(Movie, id=movie_id)
+        review = get_object_or_404(Review, user=request.user, movie=movie)
+
+        serializer = ReviewSerializer(review, data=request.data, partial=True)
+        if serializer.is_valid():
+            serializer.save()
+            movie.update_average_rating()
+            return Response(serializer.data, status=status.HTTP_200_OK)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    patch = put
+
+
+class ReportReviewView(APIView):
+    """
+    Task 3: Report inappropriate review content for admin moderation.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, review_id):
+        review = get_object_or_404(Review, id=review_id)
+        reason = request.data.get('reason', 'Inappropriate or spam content')
+        review.is_reported = True
+        review.report_reason = reason[:255]
+        review.save(update_fields=['is_reported', 'report_reason'])
+        return Response(
+            {"detail": "Review has been flagged and reported for moderation."},
+            status=status.HTTP_200_OK
+        )
