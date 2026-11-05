@@ -6,6 +6,9 @@ from .views import (
     MovieDetailView,
     MovieReviewCreateUpdateView,
     ReportReviewView,
+    ShowtimeSeatLayoutView,
+    ReserveSeatsView,
+    ReleaseSeatReservationView,
 )
 
 urlpatterns = [
@@ -18,4 +21,9 @@ urlpatterns = [
     path('movies/<int:pk>/', MovieDetailView.as_view(), name='movie-detail'),
     path('movies/<int:movie_id>/reviews/', MovieReviewCreateUpdateView.as_view(), name='movie-reviews'),
     path('reviews/<int:review_id>/report/', ReportReviewView.as_view(), name='report-review'),
+
+    # Task 5 Endpoints: Live Seat Map, 2-Minute Atomic Seat Reservation & Release
+    path('showtimes/<int:showtime_id>/seats/', ShowtimeSeatLayoutView.as_view(), name='showtime-seats'),
+    path('showtimes/<int:showtime_id>/reserve/', ReserveSeatsView.as_view(), name='showtime-reserve-seats'),
+    path('bookings/<uuid:booking_id>/release/', ReleaseSeatReservationView.as_view(), name='booking-release-seats'),
 ]

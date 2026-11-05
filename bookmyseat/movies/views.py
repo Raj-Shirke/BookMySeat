@@ -1,3 +1,8 @@
+import string
+from datetime import timedelta
+from decimal import Decimal
+
+from django.db import transaction, IntegrityError
 from django.db.models import Min, Q, Count
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
@@ -10,11 +15,12 @@ from rest_framework.filters import SearchFilter, OrderingFilter
 
 from .models import (
     Movie, Booking, RecentlyViewedMovie, Genre,
-    Language, Theater, Review
+    Language, Theater, Review, Showtime, SeatReservation
 )
 from .serializers import (
     MovieListSerializer, MovieDetailSerializer,
-    GenreSerializer, LanguageSerializer, ReviewSerializer
+    GenreSerializer, LanguageSerializer, ReviewSerializer,
+    SeatReservationRequestSerializer, BookingReservationSerializer
 )
 from .filters import MovieDiscoveryFilter
 
@@ -46,10 +52,10 @@ class MovieDiscoveryListView(generics.ListAPIView):
     filterset_class = MovieDiscoveryFilter
     search_fields = ['title', 'description', 'cast__name']
     ordering_fields = [
-        'total_bookings_count',  # Popularity
-        'release_date',          # Newest releases
-        'average_rating',        # Rating
-        'min_ticket_price',      # Ticket price
+        'total_bookings_count',
+        'release_date',
+        'average_rating',
+        'min_ticket_price',
     ]
     ordering = ['-total_bookings_count', '-release_date']
 
@@ -158,6 +164,11 @@ class MovieDetailView(generics.RetrieveAPIView):
 
 
 class MovieReviewCreateUpdateView(APIView):
+    """
+    Task 3: Submit or Edit a rating & review.
+    Enforces rule: Registered users can only review AFTER booking and watching the movie.
+    Automatically updates Movie.average_rating.
+    """
     permission_classes = [permissions.IsAuthenticatedOrReadOnly]
 
     def get(self, request, movie_id):
@@ -227,5 +238,267 @@ class ReportReviewView(APIView):
         review.save(update_fields=['is_reported', 'report_reason'])
         return Response(
             {"detail": "Review has been flagged and reported for moderation."},
+            status=status.HTTP_200_OK
+        )
+
+
+# ============================================================================
+# TASK 5: SMART SEAT RESERVATION WITH LIVE AVAILABILITY & 2-MINUTE HOLD
+# ============================================================================
+
+def release_expired_holds(showtime_id=None):
+    """
+    Automatically releases any temporarily RESERVED seats whose 2-minute lock
+    has expired (locked_until <= now) and marks their parent PENDING bookings as CANCELLED.
+    """
+    now = timezone.now()
+    expired_seats_qs = SeatReservation.objects.filter(
+        status='RESERVED',
+        locked_until__lte=now
+    )
+    if showtime_id:
+        expired_seats_qs = expired_seats_qs.filter(showtime_id=showtime_id)
+
+    expired_booking_ids = list(expired_seats_qs.values_list('booking_id', flat=True).distinct())
+    if expired_booking_ids:
+        expired_seats_qs.delete()
+        Booking.objects.filter(
+            id__in=expired_booking_ids,
+            status='PENDING'
+        ).update(status='CANCELLED')
+
+
+class ShowtimeSeatLayoutView(APIView):
+    """
+    Task 5: Live Seat Availability Matrix for a Showtime.
+    Automatically purges expired 2-minute holds first, then returns the complete
+    row/column seat map with clear status indicators: AVAILABLE, RESERVED, or BOOKED.
+    """
+    def get(self, request, showtime_id):
+        showtime = get_object_or_404(
+            Showtime.objects.select_related('movie', 'screen__theater'),
+            id=showtime_id
+        )
+
+        # Clean up any expired 2-minute seat locks before calculating availability
+        release_expired_holds(showtime_id=showtime.id)
+
+        screen = showtime.screen
+        active_reservations = SeatReservation.objects.filter(
+            showtime=showtime
+        ).select_related('booking')
+
+        seat_lookup = {
+            (res.row_label, res.seat_number): res
+            for res in active_reservations
+        }
+
+        row_labels = list(string.ascii_uppercase[:screen.rows])
+        seat_grid = []
+        counts = {'AVAILABLE': 0, 'RESERVED': 0, 'BOOKED': 0}
+
+        for r_label in row_labels:
+            row_seats = []
+            for c_num in range(1, screen.cols + 1):
+                res = seat_lookup.get((r_label, c_num))
+                if res:
+                    seat_status = res.status  # 'RESERVED' or 'BOOKED'
+                    is_mine = (
+                        request.user.is_authenticated
+                        and res.booking.user_id == request.user.id
+                    )
+                    locked_until = res.locked_until if seat_status == 'RESERVED' else None
+                else:
+                    seat_status = 'AVAILABLE'
+                    is_mine = False
+                    locked_until = None
+
+                counts[seat_status] += 1
+                row_seats.append({
+                    'seat_code': f"{r_label}{c_num}",
+                    'row_label': r_label,
+                    'seat_number': c_num,
+                    'status': seat_status,
+                    'is_reserved_by_current_user': is_mine,
+                    'locked_until': locked_until,
+                })
+            seat_grid.append({
+                'row_label': r_label,
+                'seats': row_seats
+            })
+
+        return Response({
+            'showtime_id': showtime.id,
+            'movie_title': showtime.movie.title,
+            'theater_name': screen.theater.name,
+            'city': screen.theater.city,
+            'screen_name': screen.name,
+            'start_time': showtime.start_time,
+            'ticket_price': showtime.ticket_price,
+            'hold_duration_seconds': 120,
+            'summary': {
+                'total_capacity': screen.capacity,
+                'available_seats': counts['AVAILABLE'],
+                'reserved_seats': counts['RESERVED'],
+                'booked_seats': counts['BOOKED'],
+            },
+            'seat_map': seat_grid,
+        })
+
+
+class ReserveSeatsView(APIView):
+    """
+    Task 5: Concurrency-Safe Seat Reservation & Pre-Payment Seat Modification.
+    - Uses transaction.atomic() and select_for_update() row-level locking to ensure
+      simultaneous requests for the same seat never create duplicate bookings.
+    - Holds selected seats for 2 minutes (120 seconds).
+    - Allows users to modify their seat selection before payment by passing booking_id
+      (or automatically updating their active PENDING booking for this showtime).
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, showtime_id):
+        serializer = SeatReservationRequestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        requested_seats = serializer.validated_data['seats']
+        booking_uuid = serializer.validated_data.get('booking_id')
+
+        try:
+            with transaction.atomic():
+                # 1. Acquire row-level lock on the Showtime row to serialize concurrent reservations
+                showtime = get_object_or_404(
+                    Showtime.objects.select_for_update().select_related('screen', 'movie'),
+                    id=showtime_id
+                )
+
+                # 2. Release any expired 2-minute holds inside the atomic block
+                release_expired_holds(showtime_id=showtime.id)
+
+                screen = showtime.screen
+                valid_rows = set(string.ascii_uppercase[:screen.rows])
+
+                # 3. Validate seat coordinates against screen dimensions
+                for s in requested_seats:
+                    if s['row_label'] not in valid_rows or s['seat_number'] > screen.cols:
+                        return Response(
+                            {"detail": f"Seat {s['row_label']}{s['seat_number']} does not exist in {screen.name}."},
+                            status=status.HTTP_400_BAD_REQUEST
+                        )
+
+                # 4. Identify if the user is modifying an existing PENDING booking
+                existing_booking = None
+                if booking_uuid:
+                    existing_booking = Booking.objects.select_for_update().filter(
+                        booking_id=booking_uuid,
+                        user=request.user,
+                        showtime=showtime,
+                        status='PENDING'
+                    ).first()
+                else:
+                    existing_booking = Booking.objects.select_for_update().filter(
+                        user=request.user,
+                        showtime=showtime,
+                        status='PENDING'
+                    ).first()
+
+                # 5. Lock & check if any requested seats are already RESERVED or BOOKED by another user
+                seat_filter = Q()
+                for s in requested_seats:
+                    seat_filter |= Q(row_label=s['row_label'], seat_number=s['seat_number'])
+
+                conflicting_qs = SeatReservation.objects.select_for_update().filter(
+                    showtime=showtime
+                ).filter(seat_filter)
+
+                if existing_booking:
+                    conflicting_qs = conflicting_qs.exclude(booking=existing_booking)
+
+                conflicts = list(conflicting_qs.values_list('row_label', 'seat_number', 'status'))
+                if conflicts:
+                    conflict_labels = [f"{r}{n} ({st})" for r, n, st in conflicts]
+                    return Response(
+                        {
+                            "detail": "One or more selected seats are no longer available.",
+                            "unavailable_seats": conflict_labels
+                        },
+                        status=status.HTTP_409_CONFLICT
+                    )
+
+                # 6. Create or update the PENDING booking with a fresh 2-minute lock timer
+                now = timezone.now()
+                lock_expiry = now + timedelta(minutes=2)
+                total_price = showtime.ticket_price * Decimal(len(requested_seats))
+
+                if existing_booking:
+                    existing_booking.seats.all().delete()
+                    existing_booking.total_amount = total_price
+                    existing_booking.expires_at = lock_expiry
+                    existing_booking.save(update_fields=['total_amount', 'expires_at'])
+                    booking = existing_booking
+                else:
+                    booking = Booking.objects.create(
+                        user=request.user,
+                        showtime=showtime,
+                        total_amount=total_price,
+                        status='PENDING',
+                        expires_at=lock_expiry
+                    )
+
+                # 7. Bulk create the SeatReservation locks
+                new_reservations = [
+                    SeatReservation(
+                        showtime=showtime,
+                        booking=booking,
+                        row_label=s['row_label'],
+                        seat_number=s['seat_number'],
+                        status='RESERVED',
+                        locked_until=lock_expiry
+                    )
+                    for s in requested_seats
+                ]
+                SeatReservation.objects.bulk_create(new_reservations)
+
+        except IntegrityError:
+            # Database-level unique_together fallback in case of ultra-tight race condition
+            return Response(
+                {"detail": "Concurrent booking conflict detected. Those seats were just taken by another user."},
+                status=status.HTTP_409_CONFLICT
+            )
+
+        booking.refresh_from_db()
+        return Response(
+            BookingReservationSerializer(booking).data,
+            status=status.HTTP_201_CREATED
+        )
+
+    put = post
+
+
+class ReleaseSeatReservationView(APIView):
+    """
+    Task 5: Allows a user to manually cancel/release their 2-minute seat hold
+    before payment completes.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, booking_id):
+        with transaction.atomic():
+            booking = get_object_or_404(
+                Booking.objects.select_for_update(),
+                booking_id=booking_id,
+                user=request.user
+            )
+            if booking.status != 'PENDING':
+                return Response(
+                    {"detail": f"Cannot release seats for a booking with status '{booking.status}'."},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            booking.seats.all().delete()
+            booking.status = 'CANCELLED'
+            booking.save(update_fields=['status'])
+
+        return Response(
+            {"detail": "Reserved seats have been released and booking cancelled."},
             status=status.HTTP_200_OK
         )

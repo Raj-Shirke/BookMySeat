@@ -2,7 +2,7 @@ import re
 from rest_framework import serializers
 from .models import (
     Genre, Language, CastMember, Movie, MoviePoster,
-    Theater, Screen, Showtime, Review
+    Theater, Screen, Showtime, Review, Booking, SeatReservation
 )
 
 
@@ -95,7 +95,6 @@ class MovieDetailSerializer(serializers.ModelSerializer):
         ]
 
     def get_secure_trailer_embed_url(self, obj):
-        """Converts standard YouTube watch/share links into secure privacy-enhanced embed URLs."""
         url = obj.trailer_youtube_url or ''
         match = re.search(r'(?:v=|youtu\.be/|embed/)([a-zA-Z0-9_-]{11})', url)
         if match:
@@ -104,7 +103,6 @@ class MovieDetailSerializer(serializers.ModelSerializer):
         return url
 
     def get_reviews(self, obj):
-        # Hide reported reviews from public display unless moderated
         approved_reviews = obj.reviews.filter(is_reported=False).select_related('user').order_by('-created_at')
         return ReviewSerializer(approved_reviews, many=True).data
 
@@ -135,3 +133,63 @@ class MovieDetailSerializer(serializers.ModelSerializer):
             .order_by('-release_date')[:6]
         )
         return MovieListSerializer(recent, many=True).data
+
+
+# --- TASK 5 SERIALIZERS: SMART SEAT RESERVATION ---
+
+class SeatItemInputSerializer(serializers.Serializer):
+    row_label = serializers.CharField(max_length=5)
+    seat_number = serializers.IntegerField(min_value=1)
+
+
+class SeatReservationRequestSerializer(serializers.Serializer):
+    seats = SeatItemInputSerializer(many=True, allow_empty=False)
+    booking_id = serializers.UUIDField(required=False, allow_null=True)
+
+    def validate_seats(self, value):
+        seen = set()
+        cleaned = []
+        for item in value:
+            row = item['row_label'].strip().upper()
+            num = item['seat_number']
+            key = (row, num)
+            if key in seen:
+                raise serializers.ValidationError(f"Duplicate seat {row}{num} in request.")
+            seen.add(key)
+            cleaned.append({'row_label': row, 'seat_number': num})
+        return cleaned
+
+
+class ReservedSeatOutputSerializer(serializers.ModelSerializer):
+    seat_code = serializers.SerializerMethodField()
+
+    class Meta:
+        model = SeatReservation
+        fields = ['id', 'row_label', 'seat_number', 'seat_code', 'status', 'locked_until']
+
+    def get_seat_code(self, obj):
+        return f"{obj.row_label}{obj.seat_number}"
+
+
+class BookingReservationSerializer(serializers.ModelSerializer):
+    seats = ReservedSeatOutputSerializer(many=True, read_only=True)
+    movie_title = serializers.CharField(source='showtime.movie.title', read_only=True)
+    theater_name = serializers.CharField(source='showtime.screen.theater.name', read_only=True)
+    screen_name = serializers.CharField(source='showtime.screen.name', read_only=True)
+    show_start_time = serializers.DateTimeField(source='showtime.start_time', read_only=True)
+    remaining_seconds = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Booking
+        fields = [
+            'booking_id', 'status', 'movie_title', 'theater_name',
+            'screen_name', 'show_start_time', 'total_amount',
+            'expires_at', 'remaining_seconds', 'seats', 'created_at'
+        ]
+
+    def get_remaining_seconds(self, obj):
+        from django.utils import timezone
+        if obj.status != 'PENDING' or not obj.expires_at:
+            return 0
+        delta = (obj.expires_at - timezone.now()).total_seconds()
+        return max(0, int(delta))
