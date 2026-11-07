@@ -4,6 +4,11 @@ from .models import (
     Theater, Screen, Showtime, Booking, SeatReservation,
     Review, RecentlyViewedMovie
 )
+from .models import (
+    Genre, Language, CastMember, Movie, MoviePoster,
+    Theater, Screen, Showtime, Booking, SeatReservation,
+    Review, RecentlyViewedMovie, PaymentTransaction
+)
 
 class MoviePosterInline(admin.TabularInline):
     model = MoviePoster
@@ -49,6 +54,12 @@ class BookingAdmin(admin.ModelAdmin):
     list_display = ('booking_id', 'user', 'showtime', 'total_amount', 'status', 'created_at')
     list_filter = ('status', 'created_at')
     search_fields = ('booking_id', 'user__username', 'payment_reference_id')
+
+@admin.register(PaymentTransaction)
+class PaymentTransactionAdmin(admin.ModelAdmin):
+    list_display = ('transaction_id', 'booking', 'user', 'gateway_order_id', 'gateway_payment_id', 'amount', 'status', 'created_at')
+    list_filter = ('status', 'provider', 'created_at')
+    search_fields = ('gateway_order_id', 'gateway_payment_id', 'user__username')
 
 admin.site.register(Genre)
 admin.site.register(Language)

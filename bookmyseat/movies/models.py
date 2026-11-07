@@ -207,3 +207,35 @@ class RecentlyViewedMovie(models.Model):
     class Meta:
         unique_together = ('user', 'movie')
         ordering = ['-viewed_at']
+
+class PaymentTransaction(models.Model):
+    TRANSACTION_STATUS = [
+        ('INITIATED', 'Initiated'),
+        ('SUCCESS', 'Success'),
+        ('FAILED', 'Failed'),
+        ('CANCELLED', 'Cancelled'),
+        ('REFUNDED', 'Refunded'),
+    ]
+
+    transaction_id = models.UUIDField(default=uuid.uuid4, editable=False, unique=True, db_index=True)
+    booking = models.ForeignKey(Booking, on_delete=models.CASCADE, related_name='transactions')
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='payment_transactions')
+    provider = models.CharField(max_length=20, default='RAZORPAY')
+    gateway_order_id = models.CharField(max_length=150, db_index=True)
+    gateway_payment_id = models.CharField(max_length=150, blank=True, null=True, unique=True)
+    gateway_signature = models.CharField(max_length=255, blank=True, null=True)
+    amount = models.DecimalField(max_digits=10, decimal_places=2)
+    status = models.CharField(max_length=15, choices=TRANSACTION_STATUS, default='INITIATED', db_index=True)
+    failure_reason = models.CharField(max_length=255, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['gateway_order_id', 'status'], name='idx_payment_order_status'),
+            models.Index(fields=['user', 'status'], name='idx_payment_user_status'),
+        ]
+
+    def __str__(self):
+        return f"{self.gateway_order_id} - {self.status} (₹{self.amount})"

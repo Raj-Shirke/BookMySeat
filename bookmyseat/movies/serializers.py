@@ -2,7 +2,8 @@ import re
 from rest_framework import serializers
 from .models import (
     Genre, Language, CastMember, Movie, MoviePoster,
-    Theater, Screen, Showtime, Review, Booking, SeatReservation
+    Theater, Screen, Showtime, Review, Booking,
+    SeatReservation, PaymentTransaction
 )
 
 
@@ -171,10 +172,22 @@ class ReservedSeatOutputSerializer(serializers.ModelSerializer):
         return f"{obj.row_label}{obj.seat_number}"
 
 
+class PaymentTransactionSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = PaymentTransaction
+        fields = [
+            'transaction_id', 'provider', 'gateway_order_id',
+            'gateway_payment_id', 'amount', 'status',
+            'failure_reason', 'created_at'
+        ]
+
+
 class BookingReservationSerializer(serializers.ModelSerializer):
     seats = ReservedSeatOutputSerializer(many=True, read_only=True)
+    transactions = PaymentTransactionSerializer(many=True, read_only=True)
     movie_title = serializers.CharField(source='showtime.movie.title', read_only=True)
     theater_name = serializers.CharField(source='showtime.screen.theater.name', read_only=True)
+    city = serializers.CharField(source='showtime.screen.theater.city', read_only=True)
     screen_name = serializers.CharField(source='showtime.screen.name', read_only=True)
     show_start_time = serializers.DateTimeField(source='showtime.start_time', read_only=True)
     remaining_seconds = serializers.SerializerMethodField()
@@ -182,9 +195,10 @@ class BookingReservationSerializer(serializers.ModelSerializer):
     class Meta:
         model = Booking
         fields = [
-            'booking_id', 'status', 'movie_title', 'theater_name',
+            'booking_id', 'status', 'movie_title', 'theater_name', 'city',
             'screen_name', 'show_start_time', 'total_amount',
-            'expires_at', 'remaining_seconds', 'seats', 'created_at'
+            'payment_Order_id', 'payment_reference_id',
+            'expires_at', 'remaining_seconds', 'seats', 'transactions', 'created_at'
         ]
 
     def get_remaining_seconds(self, obj):
@@ -193,3 +207,22 @@ class BookingReservationSerializer(serializers.ModelSerializer):
             return 0
         delta = (obj.expires_at - timezone.now()).total_seconds()
         return max(0, int(delta))
+
+
+# --- TASK 4 SERIALIZERS: PAYMENT WORKFLOW ---
+
+class CreatePaymentOrderSerializer(serializers.Serializer):
+    booking_id = serializers.UUIDField()
+
+
+class VerifyPaymentSerializer(serializers.Serializer):
+    booking_id = serializers.UUIDField()
+    razorpay_order_id = serializers.CharField(max_length=150)
+    razorpay_payment_id = serializers.CharField(max_length=150, required=False, allow_blank=True)
+    razorpay_signature = serializers.CharField(max_length=255, required=False, allow_blank=True)
+    payment_outcome = serializers.ChoiceField(
+        choices=['SUCCESS', 'FAILED', 'CANCELLED'],
+        default='SUCCESS',
+        help_text="Use SUCCESS, FAILED, or CANCELLED to test all payment states."
+    )
+    failure_reason = serializers.CharField(max_length=255, required=False, allow_blank=True)

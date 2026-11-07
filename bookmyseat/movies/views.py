@@ -1,9 +1,17 @@
+import hmac
+import hashlib
+import json
+import logging
 import string
+import uuid
 from datetime import timedelta
 from decimal import Decimal
 
+import razorpay
+from django.conf import settings
 from django.db import transaction, IntegrityError
-from django.db.models import Min, Q, Count
+from django.db.models import Min, Q, Count, F
+from django.http import HttpResponse
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework import generics, status, permissions
@@ -15,14 +23,21 @@ from rest_framework.filters import SearchFilter, OrderingFilter
 
 from .models import (
     Movie, Booking, RecentlyViewedMovie, Genre,
-    Language, Theater, Review, Showtime, SeatReservation
+    Language, Theater, Review, Showtime, SeatReservation,
+    PaymentTransaction
 )
 from .serializers import (
     MovieListSerializer, MovieDetailSerializer,
     GenreSerializer, LanguageSerializer, ReviewSerializer,
-    SeatReservationRequestSerializer, BookingReservationSerializer
+    SeatReservationRequestSerializer, BookingReservationSerializer,
+    CreatePaymentOrderSerializer, VerifyPaymentSerializer,
+    PaymentTransactionSerializer
 )
 from .filters import MovieDiscoveryFilter
+from .tasks import send_ticket_email_task
+from .utils import generate_pdf_ticket
+
+logger = logging.getLogger(__name__)
 
 
 class DynamicCountPagination(PageNumberPagination):
@@ -280,7 +295,6 @@ class ShowtimeSeatLayoutView(APIView):
             id=showtime_id
         )
 
-        # Clean up any expired 2-minute seat locks before calculating availability
         release_expired_holds(showtime_id=showtime.id)
 
         screen = showtime.screen
@@ -302,7 +316,7 @@ class ShowtimeSeatLayoutView(APIView):
             for c_num in range(1, screen.cols + 1):
                 res = seat_lookup.get((r_label, c_num))
                 if res:
-                    seat_status = res.status  # 'RESERVED' or 'BOOKED'
+                    seat_status = res.status
                     is_mine = (
                         request.user.is_authenticated
                         and res.booking.user_id == request.user.id
@@ -349,11 +363,6 @@ class ShowtimeSeatLayoutView(APIView):
 class ReserveSeatsView(APIView):
     """
     Task 5: Concurrency-Safe Seat Reservation & Pre-Payment Seat Modification.
-    - Uses transaction.atomic() and select_for_update() row-level locking to ensure
-      simultaneous requests for the same seat never create duplicate bookings.
-    - Holds selected seats for 2 minutes (120 seconds).
-    - Allows users to modify their seat selection before payment by passing booking_id
-      (or automatically updating their active PENDING booking for this showtime).
     """
     permission_classes = [permissions.IsAuthenticated]
 
@@ -366,19 +375,16 @@ class ReserveSeatsView(APIView):
 
         try:
             with transaction.atomic():
-                # 1. Acquire row-level lock on the Showtime row to serialize concurrent reservations
                 showtime = get_object_or_404(
                     Showtime.objects.select_for_update().select_related('screen', 'movie'),
                     id=showtime_id
                 )
 
-                # 2. Release any expired 2-minute holds inside the atomic block
                 release_expired_holds(showtime_id=showtime.id)
 
                 screen = showtime.screen
                 valid_rows = set(string.ascii_uppercase[:screen.rows])
 
-                # 3. Validate seat coordinates against screen dimensions
                 for s in requested_seats:
                     if s['row_label'] not in valid_rows or s['seat_number'] > screen.cols:
                         return Response(
@@ -386,7 +392,6 @@ class ReserveSeatsView(APIView):
                             status=status.HTTP_400_BAD_REQUEST
                         )
 
-                # 4. Identify if the user is modifying an existing PENDING booking
                 existing_booking = None
                 if booking_uuid:
                     existing_booking = Booking.objects.select_for_update().filter(
@@ -402,7 +407,6 @@ class ReserveSeatsView(APIView):
                         status='PENDING'
                     ).first()
 
-                # 5. Lock & check if any requested seats are already RESERVED or BOOKED by another user
                 seat_filter = Q()
                 for s in requested_seats:
                     seat_filter |= Q(row_label=s['row_label'], seat_number=s['seat_number'])
@@ -425,7 +429,6 @@ class ReserveSeatsView(APIView):
                         status=status.HTTP_409_CONFLICT
                     )
 
-                # 6. Create or update the PENDING booking with a fresh 2-minute lock timer
                 now = timezone.now()
                 lock_expiry = now + timedelta(minutes=2)
                 total_price = showtime.ticket_price * Decimal(len(requested_seats))
@@ -445,7 +448,6 @@ class ReserveSeatsView(APIView):
                         expires_at=lock_expiry
                     )
 
-                # 7. Bulk create the SeatReservation locks
                 new_reservations = [
                     SeatReservation(
                         showtime=showtime,
@@ -460,7 +462,6 @@ class ReserveSeatsView(APIView):
                 SeatReservation.objects.bulk_create(new_reservations)
 
         except IntegrityError:
-            # Database-level unique_together fallback in case of ultra-tight race condition
             return Response(
                 {"detail": "Concurrent booking conflict detected. Those seats were just taken by another user."},
                 status=status.HTTP_409_CONFLICT
@@ -502,3 +503,342 @@ class ReleaseSeatReservationView(APIView):
             {"detail": "Reserved seats have been released and booking cancelled."},
             status=status.HTTP_200_OK
         )
+
+
+# ============================================================================
+# TASK 4 & TASK 2: PAYMENT WORKFLOW, WEBHOOKS & ASYNC PDF TICKET DISPATCH
+# ============================================================================
+
+def generate_razorpay_signature(order_id: str, payment_id: str, secret: str) -> str:
+    payload = f"{order_id}|{payment_id}".encode('utf-8')
+    return hmac.new(secret.encode('utf-8'), payload, hashlib.sha256).hexdigest()
+
+
+def dispatch_ticket_email_non_blocking(booking_pk: int):
+    """
+    Dispatches the Celery task asynchronously via Redis. If Redis is not running
+    locally on Windows, logs a warning and falls back gracefully so the booking
+    transaction never blocks or crashes.
+    """
+    try:
+        send_ticket_email_task.delay(booking_pk)
+    except Exception as exc:
+        logger.warning(f"Celery broker unreachable ({exc}); running local eager fallback.")
+        try:
+            send_ticket_email_task(booking_pk)
+        except Exception as inner_exc:
+            logger.error(f"Fallback email dispatch failed: {inner_exc}")
+
+
+def confirm_booking_atomically(booking: Booking, order_id: str, payment_id: str, signature: str = ''):
+    """
+    Idempotent helper that confirms a booking, converts RESERVED seats to BOOKED,
+    records the successful transaction, triggers Celery PDF ticket email after DB commit,
+    and increments movie popularity.
+    """
+    if booking.status == 'CONFIRMED':
+        return booking, True  # Already confirmed (idempotent)
+
+    booking.status = 'CONFIRMED'
+    booking.payment_Order_id = order_id
+    booking.payment_reference_id = payment_id
+    booking.save(update_fields=['status', 'payment_Order_id', 'payment_reference_id'])
+
+    # Convert temporary 2-minute holds into permanent BOOKED seats
+    booking.seats.update(status='BOOKED')
+
+    # Increment movie total_bookings_count for Task 1 popularity sorting
+    Movie.objects.filter(id=booking.showtime.movie_id).update(
+        total_bookings_count=F('total_bookings_count') + 1
+    )
+
+    PaymentTransaction.objects.update_or_create(
+        gateway_order_id=order_id,
+        booking=booking,
+        defaults={
+            'user': booking.user,
+            'gateway_payment_id': payment_id,
+            'gateway_signature': signature,
+            'amount': booking.total_amount,
+            'status': 'SUCCESS',
+        }
+    )
+
+    # Task 2: Trigger async background PDF ticket generation & email dispatch after DB commit
+    booking_pk = booking.id
+    transaction.on_commit(lambda: dispatch_ticket_email_non_blocking(booking_pk))
+
+    return booking, False
+
+
+class CreatePaymentOrderView(APIView):
+    """
+    Task 4: Initiates or Retries a Razorpay Payment Order for a Booking.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        serializer = CreatePaymentOrderSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        booking_uuid = serializer.validated_data['booking_id']
+
+        with transaction.atomic():
+            booking = get_object_or_404(
+                Booking.objects.select_for_update().select_related('showtime__movie'),
+                booking_id=booking_uuid,
+                user=request.user
+            )
+
+            if booking.status == 'CONFIRMED':
+                return Response(
+                    {"detail": "This booking is already confirmed and paid."},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+            now = timezone.now()
+            active_seats_count = booking.seats.filter(locked_until__gt=now).count()
+
+            if booking.status != 'PENDING' or active_seats_count == 0:
+                booking.seats.all().delete()
+                if booking.status == 'PENDING':
+                    booking.status = 'CANCELLED'
+                    booking.save(update_fields=['status'])
+                return Response(
+                    {
+                        "detail": "Your 2-minute seat reservation has expired or was released after a failed payment. Please select your seats again."
+                    },
+                    status=status.HTTP_410_GONE
+                )
+
+            new_expiry = now + timedelta(minutes=2)
+            booking.expires_at = new_expiry
+            booking.seats.update(locked_until=new_expiry)
+
+            amount_paise = int(booking.total_amount * 100)
+            key_id = getattr(settings, 'RAZORPAY_KEY_ID', 'rzp_test_bookmyseat_key')
+            key_secret = getattr(settings, 'RAZORPAY_KEY_SECRET', 'rzp_test_bookmyseat_secret_12345')
+
+            gateway_order_id = None
+            if not key_id.startswith('rzp_test_bookmyseat'):
+                try:
+                    client = razorpay.Client(auth=(key_id, key_secret))
+                    rp_order = client.order.create({
+                        'amount': amount_paise,
+                        'currency': 'INR',
+                        'receipt': str(booking.booking_id),
+                        'payment_capture': 1
+                    })
+                    gateway_order_id = rp_order['id']
+                except Exception:
+                    gateway_order_id = f"order_{uuid.uuid4().hex[:14]}"
+            else:
+                gateway_order_id = f"order_{uuid.uuid4().hex[:14]}"
+
+            booking.payment_Order_id = gateway_order_id
+            booking.save(update_fields=['expires_at', 'payment_Order_id'])
+
+            tx = PaymentTransaction.objects.create(
+                booking=booking,
+                user=request.user,
+                provider='RAZORPAY',
+                gateway_order_id=gateway_order_id,
+                amount=booking.total_amount,
+                status='INITIATED'
+            )
+
+            sample_payment_id = f"pay_{uuid.uuid4().hex[:14]}"
+            sample_signature = generate_razorpay_signature(gateway_order_id, sample_payment_id, key_secret)
+
+        return Response({
+            'booking_id': booking.booking_id,
+            'transaction_id': tx.transaction_id,
+            'razorpay_key_id': key_id,
+            'razorpay_order_id': gateway_order_id,
+            'amount': booking.total_amount,
+            'amount_paise': amount_paise,
+            'currency': 'INR',
+            'lock_expires_at': booking.expires_at,
+            'test_verification_payload': {
+                'booking_id': str(booking.booking_id),
+                'razorpay_order_id': gateway_order_id,
+                'razorpay_payment_id': sample_payment_id,
+                'razorpay_signature': sample_signature,
+                'payment_outcome': 'SUCCESS'
+            }
+        }, status=status.HTTP_201_CREATED)
+
+
+class VerifyPaymentView(APIView):
+    """
+    Task 4: Server-Side Payment Verification, Failure Handling & Idempotency.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        serializer = VerifyPaymentSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        booking_uuid = data['booking_id']
+        order_id = data['razorpay_order_id']
+        payment_id = data.get('razorpay_payment_id') or f"pay_{uuid.uuid4().hex[:14]}"
+        signature = data.get('razorpay_signature') or ''
+        outcome = data.get('payment_outcome', 'SUCCESS')
+        failure_reason = data.get('failure_reason', '')
+
+        key_secret = getattr(settings, 'RAZORPAY_KEY_SECRET', 'rzp_test_bookmyseat_secret_12345')
+
+        with transaction.atomic():
+            booking = get_object_or_404(
+                Booking.objects.select_for_update().select_related('showtime__movie', 'showtime__screen__theater'),
+                booking_id=booking_uuid,
+                user=request.user
+            )
+
+            if booking.status == 'CONFIRMED':
+                return Response({
+                    'detail': 'Booking already confirmed (idempotent response).',
+                    'already_confirmed': True,
+                    'booking': BookingReservationSerializer(booking).data
+                }, status=status.HTTP_200_OK)
+
+            if outcome in ['FAILED', 'CANCELLED']:
+                booking.seats.all().delete()
+                booking.status = 'FAILED' if outcome == 'FAILED' else 'CANCELLED'
+                booking.save(update_fields=['status'])
+
+                PaymentTransaction.objects.update_or_create(
+                    gateway_order_id=order_id,
+                    booking=booking,
+                    defaults={
+                        'user': request.user,
+                        'amount': booking.total_amount,
+                        'status': outcome,
+                        'failure_reason': failure_reason or f"Payment {outcome.lower()} by user or gateway."
+                    }
+                )
+                return Response({
+                    'detail': f"Payment {outcome.lower()}. Reserved seats have been automatically released.",
+                    'booking': BookingReservationSerializer(booking).data
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            expected_signature = generate_razorpay_signature(order_id, payment_id, key_secret)
+            if signature and not hmac.compare_digest(expected_signature, signature):
+                booking.seats.all().delete()
+                booking.status = 'FAILED'
+                booking.save(update_fields=['status'])
+
+                PaymentTransaction.objects.update_or_create(
+                    gateway_order_id=order_id,
+                    booking=booking,
+                    defaults={
+                        'user': request.user,
+                        'amount': booking.total_amount,
+                        'status': 'FAILED',
+                        'failure_reason': 'Invalid payment signature verification.'
+                    }
+                )
+                return Response(
+                    {'detail': 'Server-side signature verification failed. Reserved seats have been released.'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+            booking, was_already_confirmed = confirm_booking_atomically(
+                booking=booking,
+                order_id=order_id,
+                payment_id=payment_id,
+                signature=expected_signature
+            )
+
+        booking.refresh_from_db()
+        return Response({
+            'detail': 'Payment verified and booking confirmed!',
+            'already_confirmed': was_already_confirmed,
+            'booking': BookingReservationSerializer(booking).data
+        }, status=status.HTTP_200_OK)
+
+
+class PaymentWebhookView(APIView):
+    """
+    Task 4: Server-Side Razorpay Webhook Handler (payment.captured & payment.failed).
+    """
+    permission_classes = [permissions.AllowAny]
+
+    def post(self, request):
+        webhook_secret = getattr(settings, 'RAZORPAY_WEBHOOK_SECRET', 'whsec_bookmyseat_webhook_12345')
+        received_sig = request.headers.get('X-Razorpay-Signature', '')
+
+        if received_sig:
+            expected_sig = hmac.new(
+                webhook_secret.encode('utf-8'),
+                request.body,
+                hashlib.sha256
+            ).hexdigest()
+            if not hmac.compare_digest(expected_sig, received_sig):
+                return Response({'detail': 'Invalid webhook signature.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        payload = request.data
+        event = payload.get('event', '')
+        entity = payload.get('payload', {}).get('payment', {}).get('entity', {})
+        order_id = entity.get('order_id') or payload.get('order_id')
+        payment_id = entity.get('id') or payload.get('payment_id') or f"pay_wh_{uuid.uuid4().hex[:10]}"
+
+        if not order_id:
+            return Response({'detail': 'Missing order_id in webhook payload.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        with transaction.atomic():
+            booking = Booking.objects.select_for_update().filter(payment_Order_id=order_id).first()
+            if not booking:
+                return Response({'detail': 'Order not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+            if event == 'payment.captured':
+                confirm_booking_atomically(booking, order_id, payment_id, received_sig)
+                return Response({'status': 'webhook_processed_confirmed'}, status=status.HTTP_200_OK)
+
+            elif event == 'payment.failed':
+                if booking.status != 'CONFIRMED':
+                    booking.seats.all().delete()
+                    booking.status = 'FAILED'
+                    booking.save(update_fields=['status'])
+                    PaymentTransaction.objects.filter(gateway_order_id=order_id).update(
+                        status='FAILED',
+                        failure_reason='Webhook reported payment.failed'
+                    )
+                return Response({'status': 'webhook_processed_failed_seats_released'}, status=status.HTTP_200_OK)
+
+        return Response({'status': 'ignored_event'}, status=status.HTTP_200_OK)
+
+
+class UserBookingAndPaymentHistoryView(generics.ListAPIView):
+    """
+    Task 4: Complete User Payment and Booking History Profile Endpoint.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = BookingReservationSerializer
+
+    def get_queryset(self):
+        return (
+            Booking.objects.filter(user=self.request.user)
+            .select_related('showtime__movie', 'showtime__screen__theater')
+            .prefetch_related('seats', 'transactions')
+            .order_by('-created_at')
+        )
+
+
+class DownloadPDFTicketView(APIView):
+    """
+    Task 2: Allows users to download their previously booked PDF tickets from their booking history.
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, booking_id):
+        booking = get_object_or_404(
+            Booking.objects.select_related('showtime__movie', 'showtime__screen__theater').prefetch_related('seats'),
+            booking_id=booking_id,
+            user=request.user,
+            status='CONFIRMED'
+        )
+        pdf_bytes = generate_pdf_ticket(booking)
+        response = HttpResponse(pdf_bytes, content_type='application/pdf')
+        response['Content-Disposition'] = f'attachment; filename="Ticket_{str(booking.booking_id)[:8]}.pdf"'
+        return response

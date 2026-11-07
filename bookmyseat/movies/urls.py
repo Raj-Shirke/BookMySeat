@@ -9,6 +9,11 @@ from .views import (
     ShowtimeSeatLayoutView,
     ReserveSeatsView,
     ReleaseSeatReservationView,
+    CreatePaymentOrderView,
+    VerifyPaymentView,
+    PaymentWebhookView,
+    UserBookingAndPaymentHistoryView,
+    DownloadPDFTicketView,
 )
 
 urlpatterns = [
@@ -26,4 +31,13 @@ urlpatterns = [
     path('showtimes/<int:showtime_id>/seats/', ShowtimeSeatLayoutView.as_view(), name='showtime-seats'),
     path('showtimes/<int:showtime_id>/reserve/', ReserveSeatsView.as_view(), name='showtime-reserve-seats'),
     path('bookings/<uuid:booking_id>/release/', ReleaseSeatReservationView.as_view(), name='booking-release-seats'),
+
+    # Task 4 Endpoints: Razorpay Order Creation, Server-Side Verification, Webhooks & History
+    path('payments/create-order/', CreatePaymentOrderView.as_view(), name='payment-create-order'),
+    path('payments/verify/', VerifyPaymentView.as_view(), name='payment-verify'),
+    path('payments/webhook/', PaymentWebhookView.as_view(), name='payment-webhook'),
+    path('users/my-bookings/', UserBookingAndPaymentHistoryView.as_view(), name='user-booking-history'),
+
+    # Task 2 Endpoint: Download PDF Ticket with QR Code
+    path('bookings/<uuid:booking_id>/download-ticket/', DownloadPDFTicketView.as_view(), name='booking-download-ticket'),
 ]
