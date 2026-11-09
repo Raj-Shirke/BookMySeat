@@ -1,6 +1,7 @@
 from django.urls import path
 from .views import (
     MovieDiscoveryListView,
+    AuthLoginRegisterView,
     RecommendedMoviesView,
     FilterMetadataView,
     MovieDetailView,
@@ -14,10 +15,13 @@ from .views import (
     PaymentWebhookView,
     UserBookingAndPaymentHistoryView,
     DownloadPDFTicketView,
+    AdminAnalyticsDashboardView,
+    AdminAnalyticsCSVExportView,
 )
 
 urlpatterns = [
     # Task 1 Endpoints: Discovery, Recommendations & Filter Metadata
+    path('auth/', AuthLoginRegisterView.as_view(), name='api-auth'),
     path('movies/discover/', MovieDiscoveryListView.as_view(), name='movie-discover'),
     path('movies/recommendations/', RecommendedMoviesView.as_view(), name='movie-recommendations'),
     path('movies/filters-metadata/', FilterMetadataView.as_view(), name='movie-filters-metadata'),
@@ -40,4 +44,8 @@ urlpatterns = [
 
     # Task 2 Endpoint: Download PDF Ticket with QR Code
     path('bookings/<uuid:booking_id>/download-ticket/', DownloadPDFTicketView.as_view(), name='booking-download-ticket'),
+
+    # Task 6 Endpoints: Admin Analytics Dashboard & CSV Export
+    path('admin/analytics/', AdminAnalyticsDashboardView.as_view(), name='admin-analytics-dashboard'),
+    path('admin/analytics/export-csv/', AdminAnalyticsCSVExportView.as_view(), name='admin-analytics-export-csv'),
 ]
