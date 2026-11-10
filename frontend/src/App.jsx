@@ -29,12 +29,55 @@ import {
 const API_BASE =
   import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000/api";
 
+const DEFAULT_FALLBACK_POSTER =
+  "https://image.tmdb.org/t/p/w780/1pdfLvkbY9ohJlCjQH2CZjjYVvJ.jpg";
+
+const TITLE_POSTER_MAP = {
+  pushpa:
+    "https://upload.wikimedia.org/wikipedia/en/1/11/Pushpa_2-_The_Rule.jpg",
+  stree: "https://upload.wikimedia.org/wikipedia/en/a/a1/Stree_2.jpg",
+  dune: "https://image.tmdb.org/t/p/w780/1pdfLvkbY9ohJlCjQH2CZjjYVvJ.jpg",
+  kalki: "https://upload.wikimedia.org/wikipedia/en/4/4c/Kalki_2898_AD.jpg",
+  jawan: "https://upload.wikimedia.org/wikipedia/en/3/39/Jawan_film_poster.jpg",
+  oppenheimer:
+    "https://image.tmdb.org/t/p/w780/8Gxv8gSFCU0XGDykEGv7zR1n2ua.jpg",
+  interstellar:
+    "https://image.tmdb.org/t/p/w780/gEU2QniE6E77NI6lCU6MxlNBvIx.jpg",
+  batman: "https://image.tmdb.org/t/p/w780/74xTEgt7R36Fpooo50r9T25onhq.jpg",
+  avengers: "https://image.tmdb.org/t/p/w780/or06FN3Dka5tukK1e9sl16pB3iy.jpg",
+  spider: "https://image.tmdb.org/t/p/w780/8Vt6mWEReuy4Of61Lnj5Xj704m8.jpg",
+  singham:
+    "https://upload.wikimedia.org/wikipedia/en/f/f2/Singham_Again_poster.jpg",
+  bhool:
+    "https://upload.wikimedia.org/wikipedia/en/6/6f/Bhool_Bhulaiyaa_3_poster.jpg",
+  chhaava: "https://upload.wikimedia.org/wikipedia/en/7/75/Chhaava_poster.jpg",
+  animal:
+    "https://upload.wikimedia.org/wikipedia/en/9/90/Animal_%282023_film%29_poster.jpg",
+  leo: "https://upload.wikimedia.org/wikipedia/en/7/75/Leo_%282023_Indian_film%29.jpg",
+};
+
+const getMoviePoster = (movie, customUrl = null) => {
+  if (customUrl && !customUrl.includes("unsplash.com")) return customUrl;
+  const primary = movie?.posters?.[0]?.image_url;
+  if (primary && !primary.includes("unsplash.com")) return primary;
+  const titleLower = (movie?.title || "").toLowerCase();
+  for (const [key, url] of Object.entries(TITLE_POSTER_MAP)) {
+    if (titleLower.includes(key)) return url;
+  }
+  return primary || DEFAULT_FALLBACK_POSTER;
+};
+
+const handleImgError = (e) => {
+  e.currentTarget.onerror = null;
+  e.currentTarget.src = DEFAULT_FALLBACK_POSTER;
+};
+
 export default function App() {
   const [auth, setAuth] = useState(() => {
     const saved = localStorage.getItem("bms_auth");
     return saved ? JSON.parse(saved) : null;
   });
-  const [activeTab, setActiveTab] = useState("discover"); // discover | detail | seats | bookings | analytics | login
+  const [activeTab, setActiveTab] = useState("discover");
   const [toast, setToast] = useState(null);
   const [loadingMovies, setLoadingMovies] = useState(false);
   const [submitting, setSubmitting] = useState(false);
@@ -106,7 +149,6 @@ export default function App() {
     return `${m}:${s < 10 ? "0" : ""}${s}`;
   };
 
-  // Load Filter Metadata & Recommendations
   useEffect(() => {
     fetch(`${API_BASE}/movies/filters-metadata/`)
       .then((r) => r.json())
@@ -124,7 +166,6 @@ export default function App() {
       .catch(() => {});
   }, [auth]);
 
-  // Task 1: Fetch Movies whenever filters change
   useEffect(() => {
     setLoadingMovies(true);
     const params = new URLSearchParams();
@@ -141,7 +182,6 @@ export default function App() {
       .finally(() => setLoadingMovies(false));
   }, [filters]);
 
-  // 2-Minute Countdown Timer for Active Seat Hold
   useEffect(() => {
     if (!countdown || countdown <= 0) return;
     const timer = setInterval(() => {
@@ -176,14 +216,13 @@ export default function App() {
     });
   };
 
-  // Open Movie Details (Task 3)
   const openMovieDetail = async (movieId) => {
     const res = await fetch(`${API_BASE}/movies/${movieId}/`, {
       headers: authHeaders(),
     });
     const data = await res.json();
     setSelectedMovie(data);
-    setActivePoster(data.posters?.[0]?.image_url || "");
+    setActivePoster(getMoviePoster(data));
     const existingMyReview = data.reviews?.find(
       (r) => r.username === auth?.username,
     );
@@ -201,7 +240,6 @@ export default function App() {
     window.scrollTo({ top: 0, behavior: "smooth" });
   };
 
-  // Submit or Update Review (Task 3)
   const handleReviewSubmit = async (e) => {
     e.preventDefault();
     if (!auth) return setActiveTab("login");
@@ -224,7 +262,6 @@ export default function App() {
     }
   };
 
-  // Report Review (Task 3)
   const handleReportReview = async (reviewId) => {
     if (!auth) return setActiveTab("login");
     const res = await fetch(`${API_BASE}/reviews/${reviewId}/report/`, {
@@ -238,7 +275,6 @@ export default function App() {
     }
   };
 
-  // Open Live Seat Layout (Task 5)
   const openSeatMap = async (showtimeId) => {
     const res = await fetch(`${API_BASE}/showtimes/${showtimeId}/seats/`, {
       headers: authHeaders(),
@@ -262,7 +298,6 @@ export default function App() {
     );
   };
 
-  // Reserve Seats for 2 Minutes (Task 5)
   const handleReserveSeats = async () => {
     if (!auth) return setActiveTab("login");
     if (selectedSeats.length === 0)
@@ -305,7 +340,6 @@ export default function App() {
     }
   };
 
-  // Release Hold Manually (Task 5)
   const handleReleaseHold = async () => {
     if (!activeBooking) return;
     const res = await fetch(
@@ -324,7 +358,6 @@ export default function App() {
     }
   };
 
-  // Complete or Fail Payment (Task 4 & Task 2)
   const handleVerifyPayment = async (outcome = "SUCCESS") => {
     if (!paymentOrder) return;
     setSubmitting(true);
@@ -359,7 +392,6 @@ export default function App() {
     }
   };
 
-  // Fetch User Bookings (Task 4)
   const fetchMyBookings = async () => {
     if (!auth) return;
     const res = await fetch(`${API_BASE}/users/my-bookings/`, {
@@ -368,7 +400,6 @@ export default function App() {
     if (res.ok) setMyBookings(await res.json());
   };
 
-  // Download PDF Ticket with Auth Token (Task 2)
   const handleDownloadTicket = async (bookingId) => {
     const res = await fetch(
       `${API_BASE}/bookings/${bookingId}/download-ticket/`,
@@ -386,7 +417,6 @@ export default function App() {
     notify("Downloaded Official PDF Ticket!");
   };
 
-  // Fetch Admin Analytics (Task 6)
   const fetchAnalytics = async () => {
     const params = new URLSearchParams();
     if (dateRange.start_date) params.append("start_date", dateRange.start_date);
@@ -424,7 +454,6 @@ export default function App() {
     notify("Analytics CSV Exported!");
   };
 
-  // Handle Login / Register
   const handleAuthSubmit = async (e) => {
     e.preventDefault();
     const res = await fetch(`${API_BASE}/auth/`, {
@@ -455,7 +484,6 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-[#090D16] text-slate-100 flex flex-col font-sans selection:bg-rose-500 selection:text-white">
-      {/* Toast Notification */}
       {toast && (
         <div
           className={`fixed bottom-6 right-6 z-50 flex items-center gap-3 px-5 py-3.5 rounded-2xl shadow-2xl border backdrop-blur-md text-sm font-semibold transition-all duration-300 ${
@@ -473,7 +501,7 @@ export default function App() {
         </div>
       )}
 
-      {/* Top Glass Navbar */}
+      {/* Navbar */}
       <header className="sticky top-0 z-40 bg-[#090D16]/90 backdrop-blur-xl border-b border-slate-800/80">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 py-3.5 flex flex-wrap items-center justify-between gap-4">
           <button
@@ -572,12 +600,9 @@ export default function App() {
         </div>
       </header>
 
-      {/* Main Content Container */}
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 py-6 space-y-8">
-        {/* ================= TAB 1: MOVIE DISCOVERY (TASK 1) ================= */}
         {activeTab === "discover" && (
           <div className="space-y-8">
-            {/* Hero Spotlight Banner */}
             {featuredMovie && !hasActiveFilters && (
               <div className="relative rounded-3xl overflow-hidden border border-slate-800/80 bg-gradient-to-r from-slate-950 via-slate-900 to-rose-950/40 shadow-2xl">
                 <div className="grid grid-cols-1 lg:grid-cols-12 items-center p-6 sm:p-8 lg:p-10 gap-6">
@@ -616,7 +641,8 @@ export default function App() {
                   </div>
                   <div className="lg:col-span-4 flex justify-center lg:justify-end">
                     <img
-                      src={featuredMovie.posters?.[0]?.image_url}
+                      src={getMoviePoster(featuredMovie)}
+                      onError={handleImgError}
                       alt={featuredMovie.title}
                       onClick={() => openMovieDetail(featuredMovie.id)}
                       className="w-48 sm:w-56 aspect-[2/3] object-cover rounded-2xl shadow-2xl border-2 border-slate-700/60 hover:scale-105 transition duration-300 cursor-pointer"
@@ -626,7 +652,7 @@ export default function App() {
               </div>
             )}
 
-            {/* Search & Multi-Filter Control Panel */}
+            {/* Search & Filters */}
             <div className="bg-slate-900/90 border border-slate-800/90 rounded-2xl p-5 shadow-xl space-y-4">
               <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-6 gap-3">
                 <div className="sm:col-span-2 relative">
@@ -760,12 +786,10 @@ export default function App() {
 
             {/* Movie Grid */}
             <section className="space-y-4">
-              <div className="flex items-center justify-between">
-                <h2 className="text-xl font-extrabold tracking-tight flex items-center gap-2">
-                  <Film className="w-5 h-5 text-rose-500" /> Now Showing in
-                  Cinemas
-                </h2>
-              </div>
+              <h2 className="text-xl font-extrabold tracking-tight flex items-center gap-2">
+                <Film className="w-5 h-5 text-rose-500" /> Now Showing in
+                Cinemas
+              </h2>
 
               {loadingMovies ? (
                 <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-6">
@@ -782,9 +806,6 @@ export default function App() {
                   <h3 className="text-lg font-bold">
                     No Movies Match Your Filter Criteria
                   </h3>
-                  <p className="text-xs text-slate-400">
-                    Try clearing some filters or searching for another title.
-                  </p>
                   <button
                     onClick={resetFilters}
                     className="px-4 py-2 bg-rose-600 rounded-xl text-xs font-bold text-white"
@@ -802,15 +823,13 @@ export default function App() {
                     >
                       <div className="aspect-[2/3] bg-slate-800 relative overflow-hidden">
                         <img
-                          src={
-                            m.posters?.[0]?.image_url ||
-                            "https://images.unsplash.com/photo-1489599849927-2ee91cede3ba?w=600"
-                          }
+                          src={getMoviePoster(m)}
+                          onError={handleImgError}
                           alt={m.title}
                           className="w-full h-full object-cover group-hover:scale-105 transition duration-500"
                         />
                         <div className="absolute inset-0 bg-gradient-to-t from-slate-950 via-transparent to-transparent opacity-80" />
-                        <span className="absolute top-3 left-3 bg-slate-950/85 backdrop-blur-md border border-slate-700 px-2.5 py-1 rounded-lg text-[11px] font-extrabold tracking-wide">
+                        <span className="absolute top-3 left-3 bg-slate-950/85 backdrop-blur-md border border-slate-700 px-2.5 py-1 rounded-lg text-[11px] font-extrabold">
                           {m.age_certification}
                         </span>
                         <span className="absolute bottom-3 right-3 bg-amber-400 text-slate-950 px-2.5 py-1 rounded-lg text-xs font-black flex items-center gap-1 shadow-md">
@@ -855,21 +874,18 @@ export default function App() {
               )}
             </section>
 
-            {/* Recommended For You Section (Task 1) */}
             {recommended.length > 0 && (
               <section className="pt-6 border-t border-slate-800/80 space-y-4">
-                <div className="flex flex-wrap items-center justify-between gap-2">
-                  <div>
-                    <h2 className="text-xl font-extrabold flex items-center gap-2">
-                      <Sparkles className="w-5 h-5 text-amber-400" />{" "}
-                      Recommended for You
-                    </h2>
-                    <p className="text-xs text-slate-400 mt-0.5">
-                      {recStrategy === "personalized_history"
-                        ? "Tailored from your confirmed bookings and recently viewed movies"
-                        : "Top trending picks across BookMySeat cinemas"}
-                    </p>
-                  </div>
+                <div>
+                  <h2 className="text-xl font-extrabold flex items-center gap-2">
+                    <Sparkles className="w-5 h-5 text-amber-400" /> Recommended
+                    for You
+                  </h2>
+                  <p className="text-xs text-slate-400 mt-0.5">
+                    {recStrategy === "personalized_history"
+                      ? "Tailored from your confirmed bookings and recently viewed movies"
+                      : "Top trending picks across BookMySeat cinemas"}
+                  </p>
                 </div>
 
                 <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
@@ -880,7 +896,8 @@ export default function App() {
                       className="bg-slate-900/90 border border-slate-800 p-3.5 rounded-2xl cursor-pointer hover:border-amber-500/50 transition flex items-center gap-3.5 shadow-md"
                     >
                       <img
-                        src={m.posters?.[0]?.image_url}
+                        src={getMoviePoster(m)}
+                        onError={handleImgError}
                         alt={m.title}
                         className="w-16 h-24 object-cover rounded-xl flex-shrink-0 border border-slate-700"
                       />
@@ -907,7 +924,7 @@ export default function App() {
           </div>
         )}
 
-        {/* ================= TAB 2: MOVIE DETAILS, TRAILER & REVIEWS (TASK 3) ================= */}
+        {/* Movie Details */}
         {activeTab === "detail" && selectedMovie && (
           <div className="space-y-8">
             <button
@@ -918,10 +935,10 @@ export default function App() {
             </button>
 
             <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 bg-slate-900/90 border border-slate-800 rounded-3xl p-6 sm:p-8 shadow-2xl">
-              {/* Poster & Gallery Column */}
               <div className="lg:col-span-4 space-y-4">
                 <img
-                  src={activePoster || selectedMovie.posters?.[0]?.image_url}
+                  src={getMoviePoster(selectedMovie, activePoster)}
+                  onError={handleImgError}
                   alt={selectedMovie.title}
                   className="w-full aspect-[2/3] rounded-2xl object-cover shadow-2xl border border-slate-700"
                 />
@@ -931,6 +948,7 @@ export default function App() {
                       <img
                         key={p.id}
                         src={p.image_url}
+                        onError={handleImgError}
                         alt="Poster thumbnail"
                         onClick={() => setActivePoster(p.image_url)}
                         className={`w-16 h-24 object-cover rounded-xl cursor-pointer border-2 transition ${
@@ -944,7 +962,6 @@ export default function App() {
                 )}
               </div>
 
-              {/* Movie Info & Trailer Column */}
               <div className="lg:col-span-8 space-y-5">
                 <div className="flex flex-wrap items-start justify-between gap-4">
                   <div>
@@ -980,13 +997,8 @@ export default function App() {
                   <span className="bg-slate-950 border border-slate-800 px-3.5 py-1.5 rounded-xl">
                     Release Date: <strong>{selectedMovie.release_date}</strong>
                   </span>
-                  <span className="bg-slate-950 border border-slate-800 px-3.5 py-1.5 rounded-xl text-emerald-400">
-                    {selectedMovie.total_bookings_count?.toLocaleString()}{" "}
-                    Bookings
-                  </span>
                 </div>
 
-                {/* Cast */}
                 <div>
                   <h3 className="text-xs font-bold uppercase tracking-wider text-slate-400 mb-2.5">
                     Featured Cast & Crew
@@ -1011,7 +1023,6 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* Secure Embedded YouTube Trailer */}
                 {selectedMovie.secure_trailer_embed_url && (
                   <div className="pt-2">
                     <h3 className="text-xs font-bold uppercase tracking-wider text-slate-400 mb-2 flex items-center gap-1.5">
@@ -1031,14 +1042,11 @@ export default function App() {
               </div>
             </div>
 
-            {/* Available Showtimes -> Click to Open Seat Map */}
             <div className="bg-slate-900/90 border border-slate-800 rounded-3xl p-6 sm:p-8 space-y-4">
-              <div className="flex items-center justify-between">
-                <h2 className="text-xl font-extrabold flex items-center gap-2">
-                  <Calendar className="w-5 h-5 text-rose-500" /> Available
-                  Showtimes — Select to Reserve Seats
-                </h2>
-              </div>
+              <h2 className="text-xl font-extrabold flex items-center gap-2">
+                <Calendar className="w-5 h-5 text-rose-500" /> Available
+                Showtimes — Select to Reserve Seats
+              </h2>
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
                 {selectedMovie.showtimes?.map((st) => (
                   <button
@@ -1077,7 +1085,7 @@ export default function App() {
               </div>
             </div>
 
-            {/* Verified Viewer Reviews Section */}
+            {/* Verified Reviews */}
             <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
               <div className="lg:col-span-7 bg-slate-900/90 border border-slate-800 rounded-3xl p-6 space-y-4">
                 <h3 className="text-lg font-extrabold flex items-center gap-2">
@@ -1192,7 +1200,6 @@ export default function App() {
               </form>
             </div>
 
-            {/* Similar & Trending Movies Carousels (Task 3) */}
             {selectedMovie.similar_movies?.length > 0 && (
               <div className="space-y-3 pt-4 border-t border-slate-800">
                 <h3 className="text-lg font-extrabold">
@@ -1206,7 +1213,8 @@ export default function App() {
                       className="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden cursor-pointer hover:border-rose-500 transition"
                     >
                       <img
-                        src={sm.posters?.[0]?.image_url}
+                        src={getMoviePoster(sm)}
+                        onError={handleImgError}
                         alt={sm.title}
                         className="w-full aspect-[2/3] object-cover"
                       />
@@ -1224,7 +1232,7 @@ export default function App() {
           </div>
         )}
 
-        {/* ================= TAB 3: LIVE SEAT MAP & 2-MIN HOLD + PAYMENT (TASK 5 & 4) ================= */}
+        {/* Seat Selection */}
         {activeTab === "seats" && seatLayout && (
           <div className="space-y-6 pb-16">
             <div className="flex flex-wrap items-center justify-between gap-4 bg-slate-900 border border-slate-800 p-5 rounded-3xl">
@@ -1266,7 +1274,6 @@ export default function App() {
               </div>
             </div>
 
-            {/* Glowing Cinema Screen Curve */}
             <div className="text-center space-y-2 py-2">
               <div className="w-3/4 max-w-2xl mx-auto h-3 bg-gradient-to-r from-transparent via-rose-500 to-transparent rounded-full shadow-[0_12px_35px_rgba(244,63,94,0.6)]" />
               <p className="text-[11px] uppercase tracking-[0.25em] text-slate-400 font-semibold">
@@ -1274,7 +1281,6 @@ export default function App() {
               </p>
             </div>
 
-            {/* Interactive Seat Matrix with Center Aisle */}
             <div className="bg-slate-900/90 border border-slate-800 rounded-3xl p-6 sm:p-8 overflow-x-auto shadow-inner">
               <div className="min-w-[640px] space-y-2.5 flex flex-col items-center">
                 {seatLayout.seat_map.map((row) => (
@@ -1313,7 +1319,6 @@ export default function App() {
                               s.status !== "AVAILABLE" || Boolean(activeBooking)
                             }
                             className={`w-8 h-8 rounded-t-xl rounded-b-md border text-[11px] transition-all ${btnClass}`}
-                            title={`Seat ${s.seat_code} - ${s.status}`}
                           >
                             {s.seat_number}
                           </button>
@@ -1328,7 +1333,6 @@ export default function App() {
               </div>
             </div>
 
-            {/* Sticky Checkout & 2-Minute Hold Bar */}
             <div className="bg-slate-900 border-2 border-slate-800 rounded-3xl p-5 sm:p-6 shadow-2xl flex flex-wrap items-center justify-between gap-4">
               <div className="space-y-1">
                 <p className="text-sm font-bold">
@@ -1393,7 +1397,7 @@ export default function App() {
           </div>
         )}
 
-        {/* ================= TAB 4: USER BOOKINGS & PDF TICKET DOWNLOAD (TASK 4 & 2) ================= */}
+        {/* User Bookings */}
         {activeTab === "bookings" && (
           <div className="space-y-6">
             <div className="flex items-center justify-between">
@@ -1486,7 +1490,6 @@ export default function App() {
                       </div>
                     </div>
 
-                    {/* Perforated Ticket Footer */}
                     <div className="px-6 py-4 bg-slate-950/90 border-t border-dashed border-slate-800 flex items-center justify-between gap-3">
                       <span className="text-[11px] font-mono text-slate-500">
                         ID: #{b.booking_id.slice(0, 8)}
@@ -1508,7 +1511,7 @@ export default function App() {
           </div>
         )}
 
-        {/* ================= TAB 5: ADMIN ANALYTICS DASHBOARD (TASK 6) ================= */}
+        {/* Admin Analytics */}
         {activeTab === "analytics" && analytics && (
           <div className="space-y-6">
             <div className="flex flex-wrap items-center justify-between gap-4 bg-slate-900 border border-slate-800 p-6 rounded-3xl">
@@ -1562,7 +1565,6 @@ export default function App() {
               </div>
             </div>
 
-            {/* Revenue Breakdown KPI Cards */}
             <div className="grid grid-cols-2 lg:grid-cols-5 gap-4">
               <div className="bg-slate-900 border border-slate-800 p-4 rounded-2xl">
                 <p className="text-xs text-slate-400">
@@ -1614,7 +1616,6 @@ export default function App() {
               </div>
             </div>
 
-            {/* Top Movies & Theater Occupancy Bars */}
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
               <div className="bg-slate-900 border border-slate-800 rounded-3xl p-6 space-y-4">
                 <h3 className="font-extrabold text-base flex items-center gap-2">
@@ -1692,80 +1693,10 @@ export default function App() {
                 </div>
               </div>
             </div>
-
-            {/* Peak Booking Hours & Cancellation Breakdown */}
-            <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-              <div className="bg-slate-900 border border-slate-800 rounded-3xl p-6 space-y-3">
-                <h3 className="font-extrabold text-base">
-                  Peak Booking Hours (24-Hour Distribution)
-                </h3>
-                <div className="space-y-2 text-xs max-h-64 overflow-y-auto pr-1">
-                  {analytics.peak_booking_hours.slice(0, 8).map((h) => (
-                    <div
-                      key={h.hour}
-                      className="flex items-center justify-between p-2.5 bg-slate-950 rounded-xl"
-                    >
-                      <span className="font-mono font-bold text-slate-300">
-                        {String(h.hour).padStart(2, "0")}:00 hrs
-                      </span>
-                      <span className="text-indigo-300 font-bold">
-                        {h.bookings_count.toLocaleString()} bookings
-                      </span>
-                      <span className="text-emerald-400 font-bold">
-                        ₹{Number(h.revenue).toLocaleString()}
-                      </span>
-                    </div>
-                  ))}
-                </div>
-              </div>
-
-              <div className="bg-slate-900 border border-slate-800 rounded-3xl p-6 space-y-3">
-                <h3 className="font-extrabold text-base">
-                  Cancellation, Refund & User Growth Summary
-                </h3>
-                <div className="grid grid-cols-2 gap-3 text-xs">
-                  <div className="p-3.5 bg-slate-950 rounded-2xl border border-slate-800">
-                    <span className="text-slate-400 block">
-                      Confirmed Bookings
-                    </span>
-                    <strong className="text-lg text-emerald-400">
-                      {analytics.cancellation_and_refund_stats.confirmed_count.toLocaleString()}
-                    </strong>
-                  </div>
-                  <div className="p-3.5 bg-slate-950 rounded-2xl border border-slate-800">
-                    <span className="text-slate-400 block">
-                      Cancelled / Expired
-                    </span>
-                    <strong className="text-lg text-amber-400">
-                      {analytics.cancellation_and_refund_stats.cancelled_count.toLocaleString()}
-                    </strong>
-                  </div>
-                  <div className="p-3.5 bg-slate-950 rounded-2xl border border-slate-800">
-                    <span className="text-slate-400 block">
-                      Refunded Volume
-                    </span>
-                    <strong className="text-lg text-rose-400">
-                      ₹
-                      {Number(
-                        analytics.cancellation_and_refund_stats.refunded_amount,
-                      ).toLocaleString()}
-                    </strong>
-                  </div>
-                  <div className="p-3.5 bg-slate-950 rounded-2xl border border-slate-800">
-                    <span className="text-slate-400 block">
-                      Registered Users
-                    </span>
-                    <strong className="text-lg text-indigo-400">
-                      {analytics.user_growth_report.total_registered_users.toLocaleString()}
-                    </strong>
-                  </div>
-                </div>
-              </div>
-            </div>
           </div>
         )}
 
-        {/* ================= TAB 6: LOGIN / REGISTER ================= */}
+        {/* Login / Register */}
         {activeTab === "login" && (
           <form
             onSubmit={handleAuthSubmit}
@@ -1844,7 +1775,6 @@ export default function App() {
         )}
       </main>
 
-      {/* Footer */}
       <footer className="border-t border-slate-900 py-6 text-center text-xs text-slate-500">
         BookMySeat Enterprise Cinema Platform • Built with Django REST
         Framework, React, Celery & Razorpay
