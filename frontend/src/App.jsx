@@ -27,6 +27,9 @@ import {
   SlidersHorizontal,
   ArrowLeft,
   MoveHorizontal,
+  Loader2,
+  QrCode,
+  Server,
 } from "lucide-react";
 
 const API_BASE =
@@ -83,7 +86,9 @@ export default function App() {
   const [activeTab, setActiveTab] = useState("discover");
   const [toast, setToast] = useState(null);
   const [loadingMovies, setLoadingMovies] = useState(false);
+  const [coldStartBanner, setColdStartBanner] = useState(false);
   const [submitting, setSubmitting] = useState(false);
+  const [authLoading, setAuthLoading] = useState(false);
   const [showMobileFilters, setShowMobileFilters] = useState(false);
 
   // Task 1 State: Discovery, Filters & Recommendations
@@ -108,18 +113,21 @@ export default function App() {
     ordering: "-total_bookings_count",
   });
 
-  // Task 3 State: Selected Movie Details, Poster Preview & Reviews
+  // Task 3 State: Selected Movie Details, Region Filter & Reviews
   const [selectedMovie, setSelectedMovie] = useState(null);
   const [activePoster, setActivePoster] = useState("");
+  const [selectedDetailRegion, setSelectedDetailRegion] = useState("");
   const [reviewForm, setReviewForm] = useState({ rating: 5, comment: "" });
   const [isEditingReview, setIsEditingReview] = useState(false);
 
-  // Task 5 & 4 State: Live Seat Map, 2-Min Hold & Payment
+  // Task 5 & 4 State: Live Seat Map, 2-Min Hold, Payment & Confirmation Screen
   const [seatLayout, setSeatLayout] = useState(null);
   const [selectedSeats, setSelectedSeats] = useState([]);
   const [activeBooking, setActiveBooking] = useState(null);
   const [paymentOrder, setPaymentOrder] = useState(null);
   const [countdown, setCountdown] = useState(0);
+  const [bookingConfirmedData, setBookingConfirmedData] = useState(null);
+  const [qrModalTicket, setQrModalTicket] = useState(null);
 
   // Task 4 & 2 State: User Bookings & PDF Download
   const [myBookings, setMyBookings] = useState([]);
@@ -172,6 +180,7 @@ export default function App() {
 
   useEffect(() => {
     setLoadingMovies(true);
+    const coldTimer = setTimeout(() => setColdStartBanner(true), 2500);
     const params = new URLSearchParams();
     Object.entries(filters).forEach(([k, v]) => {
       if (v) params.append(k, v);
@@ -183,7 +192,11 @@ export default function App() {
         setTotalMatches(d.total_matching_movies || 0);
       })
       .catch(() => {})
-      .finally(() => setLoadingMovies(false));
+      .finally(() => {
+        clearTimeout(coldTimer);
+        setColdStartBanner(false);
+        setLoadingMovies(false);
+      });
   }, [filters]);
 
   useEffect(() => {
@@ -227,6 +240,7 @@ export default function App() {
     const data = await res.json();
     setSelectedMovie(data);
     setActivePoster(getMoviePoster(data));
+    setSelectedDetailRegion(filters.city || "");
     const existingMyReview = data.reviews?.find(
       (r) => r.username === auth?.username,
     );
@@ -288,6 +302,7 @@ export default function App() {
     setSelectedSeats([]);
     setActiveBooking(null);
     setPaymentOrder(null);
+    setBookingConfirmedData(null);
     setActiveTab("seats");
     window.scrollTo({ top: 0, behavior: "smooth" });
   };
@@ -378,9 +393,18 @@ export default function App() {
       const data = await res.json();
       if (res.ok) {
         setCountdown(0);
+        const confirmedSummary = {
+          booking_id: activeBooking.booking_id,
+          movie_title: seatLayout.movie_title,
+          theater_name: seatLayout.theater_name,
+          screen_name: seatLayout.screen_name,
+          seats: selectedSeats.map((s) => s.code),
+          total_amount: activeBooking.total_amount,
+          payment_ref: data.payment_reference_id || payload.razorpay_payment_id,
+        };
+        setBookingConfirmedData(confirmedSummary);
         notify("Payment Confirmed! PDF Ticket & QR Email Dispatched.");
-        fetchMyBookings();
-        setActiveTab("bookings");
+        await fetchMyBookings();
       } else {
         setCountdown(0);
         setActiveBooking(null);
@@ -460,19 +484,29 @@ export default function App() {
 
   const handleAuthSubmit = async (e) => {
     e.preventDefault();
-    const res = await fetch(`${API_BASE}/auth/`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(authForm),
-    });
-    const data = await res.json();
-    if (res.ok) {
-      localStorage.setItem("bms_auth", JSON.stringify(data));
-      setAuth(data);
-      notify(`Welcome back, ${data.username}!`);
-      setActiveTab("discover");
-    } else {
-      notify(data.detail || "Authentication failed", "error");
+    setAuthLoading(true);
+    try {
+      const res = await fetch(`${API_BASE}/auth/`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(authForm),
+      });
+      const data = await res.json();
+      if (res.ok) {
+        localStorage.setItem("bms_auth", JSON.stringify(data));
+        setAuth(data);
+        notify(`Welcome back, ${data.username}!`);
+        setActiveTab("discover");
+      } else {
+        notify(data.detail || "Authentication failed", "error");
+      }
+    } catch {
+      notify(
+        "Network error while connecting to server. Please try again.",
+        "error",
+      );
+    } finally {
+      setAuthLoading(false);
     }
   };
 
@@ -486,9 +520,139 @@ export default function App() {
   ].filter(Boolean).length;
   const hasActiveFilters = Boolean(filters.search || activeFilterCount > 0);
 
+  // Extract unique regions/cities for the currently selected movie's showtimes
+  const availableShowtimeRegions = selectedMovie?.showtimes
+    ? Array.from(
+        new Set(selectedMovie.showtimes.map((st) => st.city).filter(Boolean)),
+      )
+    : [];
+
+  const filteredMovieShowtimes =
+    selectedMovie?.showtimes?.filter(
+      (st) => !selectedDetailRegion || st.city === selectedDetailRegion,
+    ) || [];
+
+  // Calculate base ticket price + convenience fee (18% GST included) for UI transparency
+  const baseSeatSubtotal =
+    selectedSeats.length * (seatLayout?.ticket_price || 0);
+  const convenienceFee = selectedSeats.length * 30;
+  const gstAmount = Math.round(convenienceFee * 0.18);
+
   return (
     <div className="min-h-screen bg-[#090D16] text-slate-100 flex flex-col font-sans selection:bg-rose-500 selection:text-white pb-20 sm:pb-0">
-      {/* Toast Notification (Mobile-safe positioning) */}
+      {/* Full-Screen Sign-In / Registration Loading Overlay */}
+      {authLoading && (
+        <div className="fixed inset-0 z-50 bg-slate-950/85 backdrop-blur-md flex flex-col items-center justify-center p-6 text-center">
+          <div className="bg-slate-900 border border-slate-800 rounded-3xl p-8 max-w-sm w-full shadow-2xl flex flex-col items-center space-y-4">
+            <div className="w-16 h-16 rounded-2xl bg-rose-500/15 border border-rose-500/30 flex items-center justify-center">
+              <Loader2 className="w-8 h-8 text-rose-500 animate-spin" />
+            </div>
+            <div className="space-y-1">
+              <h3 className="text-lg font-black text-white">
+                {authForm.action === "login"
+                  ? "Signing You In..."
+                  : "Creating Your Account..."}
+              </h3>
+              <p className="text-xs text-slate-400 leading-relaxed">
+                Verifying credentials with the cloud cinema server. This takes
+                just a moment...
+              </p>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Interactive QR Ticket Stub Modal */}
+      {qrModalTicket && (
+        <div
+          onClick={() => setQrModalTicket(null)}
+          className="fixed inset-0 z-50 bg-slate-950/85 backdrop-blur-md flex items-center justify-center p-4"
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="bg-slate-900 border-2 border-slate-700 rounded-3xl max-w-sm w-full overflow-hidden shadow-2xl animate-in zoom-in-95 duration-200"
+          >
+            <div className="bg-gradient-to-r from-rose-600 to-rose-500 p-5 text-white flex items-center justify-between">
+              <div>
+                <span className="text-[10px] uppercase tracking-widest font-bold opacity-90">
+                  BookMySeat Verified Pass
+                </span>
+                <h3 className="font-black text-lg leading-tight mt-0.5">
+                  {qrModalTicket.movie_title}
+                </h3>
+              </div>
+              <button
+                onClick={() => setQrModalTicket(null)}
+                className="p-1.5 rounded-full bg-black/20 hover:bg-black/40 cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="p-6 space-y-5 text-center">
+              <div className="bg-white p-4 rounded-2xl inline-block mx-auto shadow-lg">
+                <img
+                  src={`https://api.qrserver.com/v1/create-qr-code/?size=160x160&data=BOOKMYSEAT-${qrModalTicket.booking_id}`}
+                  alt="Ticket QR Code"
+                  className="w-36 h-36 mx-auto"
+                />
+              </div>
+              <p className="text-[11px] font-mono text-emerald-400 bg-emerald-950/60 border border-emerald-800/60 py-1 px-3 rounded-full inline-block">
+                BOOKING ID: #
+                {qrModalTicket.booking_id.slice(0, 8).toUpperCase()}
+              </p>
+
+              <div className="text-left bg-slate-950 border border-slate-800 rounded-2xl p-4 space-y-2 text-xs">
+                <div className="flex justify-between">
+                  <span className="text-slate-500">Theater</span>
+                  <strong className="text-white text-right">
+                    {qrModalTicket.theater_name}
+                  </strong>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-slate-500">Screen</span>
+                  <strong className="text-slate-300">
+                    {qrModalTicket.screen_name}
+                  </strong>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-slate-500">Reserved Seats</span>
+                  <strong className="text-emerald-400">
+                    {Array.isArray(qrModalTicket.seats)
+                      ? qrModalTicket.seats
+                          .map((s) => s.seat_code || s)
+                          .join(", ")
+                      : "Confirmed"}
+                  </strong>
+                </div>
+                <div className="flex justify-between pt-2 border-t border-slate-800">
+                  <span className="text-slate-500">Amount Paid</span>
+                  <strong className="text-white text-sm">
+                    ₹{qrModalTicket.total_amount}
+                  </strong>
+                </div>
+              </div>
+
+              <div className="flex gap-2.5">
+                <button
+                  onClick={() => handleDownloadTicket(qrModalTicket.booking_id)}
+                  className="flex-1 py-2.5 bg-indigo-600 hover:bg-indigo-500 rounded-xl text-xs font-bold text-white flex items-center justify-center gap-1.5 cursor-pointer"
+                >
+                  <Download className="w-3.5 h-3.5" /> Download Official PDF
+                </button>
+                <button
+                  onClick={() => setQrModalTicket(null)}
+                  className="px-4 py-2.5 bg-slate-800 hover:bg-slate-700 rounded-xl text-xs font-bold text-slate-300 cursor-pointer"
+                >
+                  Close
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Toast Notification */}
       {toast && (
         <div
           className={`fixed top-16 sm:top-auto sm:bottom-6 left-4 right-4 sm:left-auto sm:right-6 z-50 flex items-center gap-3 px-4 py-3 rounded-2xl shadow-2xl border backdrop-blur-md text-xs sm:text-sm font-semibold transition-all duration-300 ${
@@ -637,10 +801,25 @@ export default function App() {
       </header>
 
       <main className="flex-1 max-w-7xl w-full mx-auto px-3.5 sm:px-6 py-4 sm:py-6 space-y-6 sm:space-y-8">
+        {/* Render Cold-Start Indicator Banner */}
+        {coldStartBanner && (
+          <div className="bg-indigo-950/80 border border-indigo-500/40 rounded-2xl p-3.5 flex items-center gap-3 text-xs text-indigo-200">
+            <Server className="w-5 h-5 text-indigo-400 animate-pulse shrink-0" />
+            <div>
+              <strong className="text-white block">
+                Waking up cloud cinema server on Render...
+              </strong>
+              <span>
+                Free-tier cloud instances take ~20–30 seconds on initial load.
+                Movies will appear momentarily!
+              </span>
+            </div>
+          </div>
+        )}
+
         {/* TAB 1: DISCOVER */}
         {activeTab === "discover" && (
           <div className="space-y-5 sm:space-y-8">
-            {/* Responsive Hero Banner */}
             {featuredMovie && !hasActiveFilters && (
               <div
                 onClick={() => openMovieDetail(featuredMovie.id)}
@@ -686,7 +865,7 @@ export default function App() {
               </div>
             )}
 
-            {/* Mobile-Friendly Search & Collapsible Filter Bar */}
+            {/* Search & Collapsible Filters */}
             <div className="bg-slate-900/90 border border-slate-800/90 rounded-2xl p-3.5 sm:p-5 shadow-xl space-y-3 sm:space-y-4">
               <div className="flex items-center gap-2">
                 <div className="relative flex-1">
@@ -710,7 +889,6 @@ export default function App() {
                   )}
                 </div>
 
-                {/* Mobile Filter Toggle Button */}
                 <button
                   onClick={() => setShowMobileFilters(!showMobileFilters)}
                   className={`sm:hidden px-3.5 py-2.5 rounded-xl border text-xs font-bold flex items-center gap-1.5 shrink-0 ${
@@ -724,7 +902,6 @@ export default function App() {
                 </button>
               </div>
 
-              {/* Filter Dropdowns (Always visible on sm+, toggleable on mobile) */}
               <div
                 className={`${showMobileFilters ? "grid" : "hidden sm:grid"} grid-cols-2 lg:grid-cols-4 gap-2.5 sm:gap-3 pt-1`}
               >
@@ -789,7 +966,6 @@ export default function App() {
                 </select>
               </div>
 
-              {/* Showtime Window Pills (Horizontally scrollable on mobile) */}
               <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-slate-800/80 text-xs">
                 <div className="flex items-center gap-1.5 overflow-x-auto no-scrollbar pb-1 sm:pb-0 max-w-full">
                   {[
@@ -831,7 +1007,7 @@ export default function App() {
               </div>
             </div>
 
-            {/* 2-Column Mobile Movie Grid */}
+            {/* Movie Grid */}
             <section className="space-y-3 sm:space-y-4">
               <h2 className="text-base sm:text-xl font-extrabold tracking-tight flex items-center gap-2">
                 <Film className="w-4 h-4 sm:w-5 sm:h-5 text-rose-500" /> Now
@@ -963,7 +1139,7 @@ export default function App() {
           </div>
         )}
 
-        {/* TAB 2: MOVIE DETAILS */}
+        {/* TAB 2: MOVIE DETAILS WITH REGION/CITY THEATER FILTER */}
         {activeTab === "detail" && selectedMovie && (
           <div className="space-y-6 sm:space-y-8">
             <button
@@ -1084,48 +1260,103 @@ export default function App() {
               </div>
             </div>
 
-            {/* Showtimes */}
+            {/* Showtimes with Region / City Selector */}
             <div className="bg-slate-900/90 border border-slate-800 rounded-2xl sm:rounded-3xl p-4 sm:p-8 space-y-4">
-              <h2 className="text-base sm:text-xl font-extrabold flex items-center gap-2">
-                <Calendar className="w-4 h-4 sm:w-5 sm:h-5 text-rose-500" />{" "}
-                Select Showtime
-              </h2>
-              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3 sm:gap-4">
-                {selectedMovie.showtimes?.map((st) => (
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-slate-800">
+                <div>
+                  <h2 className="text-base sm:text-xl font-extrabold flex items-center gap-2">
+                    <Calendar className="w-4 h-4 sm:w-5 sm:h-5 text-rose-500" />{" "}
+                    Select Theater & Showtime
+                  </h2>
+                  <p className="text-[11px] text-slate-400 mt-0.5">
+                    Filter multiplexes by region/city to view local show timings
+                  </p>
+                </div>
+
+                {/* Region Filter Pills + Dropdown */}
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <span className="text-xs text-slate-400 flex items-center gap-1 mr-1">
+                    <MapPin className="w-3.5 h-3.5 text-rose-500" /> Region:
+                  </span>
                   <button
-                    key={st.id}
-                    onClick={() => openSeatMap(st.id)}
-                    className="p-3.5 sm:p-4 rounded-2xl bg-slate-950 border border-slate-800 hover:border-rose-500 text-left transition group flex items-center justify-between cursor-pointer"
+                    onClick={() => setSelectedDetailRegion("")}
+                    className={`px-3 py-1.5 rounded-xl text-xs font-bold transition cursor-pointer ${
+                      selectedDetailRegion === ""
+                        ? "bg-rose-600 text-white shadow-md shadow-rose-600/25"
+                        : "bg-slate-950 border border-slate-800 text-slate-300 hover:border-slate-700"
+                    }`}
                   >
-                    <div className="space-y-1 min-w-0 pr-2">
-                      <p className="font-bold text-xs sm:text-sm text-white group-hover:text-rose-400 truncate">
-                        {st.theater_name}
-                      </p>
-                      <p className="text-[11px] text-slate-400 flex items-center gap-1 truncate">
-                        <MapPin className="w-3 h-3 text-slate-500 shrink-0" />{" "}
-                        {st.city} • {st.screen_name}
-                      </p>
-                      <p className="text-xs text-emerald-400 font-semibold pt-0.5">
-                        {new Date(st.start_time).toLocaleString([], {
-                          weekday: "short",
-                          month: "short",
-                          day: "numeric",
-                          hour: "2-digit",
-                          minute: "2-digit",
-                        })}
-                      </p>
-                    </div>
-                    <div className="text-right shrink-0">
-                      <span className="bg-rose-600/15 border border-rose-500/40 text-rose-300 px-2.5 py-1 rounded-xl text-xs font-extrabold block">
-                        ₹{st.ticket_price}
-                      </span>
-                      <span className="text-[10px] text-slate-500 mt-1 block">
-                        Book →
-                      </span>
-                    </div>
+                    All Regions ({selectedMovie.showtimes?.length || 0})
                   </button>
-                ))}
+                  {availableShowtimeRegions.map((region) => (
+                    <button
+                      key={region}
+                      onClick={() => setSelectedDetailRegion(region)}
+                      className={`px-3 py-1.5 rounded-xl text-xs font-bold transition cursor-pointer ${
+                        selectedDetailRegion === region
+                          ? "bg-rose-600 text-white shadow-md shadow-rose-600/25"
+                          : "bg-slate-950 border border-slate-800 text-slate-300 hover:border-slate-700"
+                      }`}
+                    >
+                      {region}
+                    </button>
+                  ))}
+                </div>
               </div>
+
+              {filteredMovieShowtimes.length === 0 ? (
+                <div className="text-center py-8 space-y-2">
+                  <p className="text-sm text-slate-400">
+                    No showtimes found in {selectedDetailRegion}.
+                  </p>
+                  <button
+                    onClick={() => setSelectedDetailRegion("")}
+                    className="px-4 py-1.5 bg-rose-600 rounded-xl text-xs font-bold text-white cursor-pointer"
+                  >
+                    Show All Regions
+                  </button>
+                </div>
+              ) : (
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3 sm:gap-4">
+                  {filteredMovieShowtimes.map((st) => (
+                    <button
+                      key={st.id}
+                      onClick={() => openSeatMap(st.id)}
+                      className="p-3.5 sm:p-4 rounded-2xl bg-slate-950 border border-slate-800 hover:border-rose-500 text-left transition group flex items-center justify-between cursor-pointer"
+                    >
+                      <div className="space-y-1 min-w-0 pr-2">
+                        <p className="font-bold text-xs sm:text-sm text-white group-hover:text-rose-400 truncate">
+                          {st.theater_name}
+                        </p>
+                        <p className="text-[11px] text-slate-400 flex items-center gap-1 truncate">
+                          <MapPin className="w-3 h-3 text-rose-400 shrink-0" />{" "}
+                          <span className="text-slate-200 font-semibold">
+                            {st.city}
+                          </span>{" "}
+                          • {st.screen_name}
+                        </p>
+                        <p className="text-xs text-emerald-400 font-semibold pt-0.5">
+                          {new Date(st.start_time).toLocaleString([], {
+                            weekday: "short",
+                            month: "short",
+                            day: "numeric",
+                            hour: "2-digit",
+                            minute: "2-digit",
+                          })}
+                        </p>
+                      </div>
+                      <div className="text-right shrink-0">
+                        <span className="bg-rose-600/15 border border-rose-500/40 text-rose-300 px-2.5 py-1 rounded-xl text-xs font-extrabold block">
+                          ₹{st.ticket_price}
+                        </span>
+                        <span className="text-[10px] text-slate-500 mt-1 block">
+                          Book →
+                        </span>
+                      </div>
+                    </button>
+                  ))}
+                </div>
+              )}
             </div>
 
             {/* Verified Reviews */}
@@ -1232,175 +1463,290 @@ export default function App() {
           </div>
         )}
 
-        {/* TAB 3: SEAT SELECTION (Touch-Scrollable + Sticky Mobile Footer) */}
+        {/* TAB 3: SEAT SELECTION & BOOKING CONFIRMATION TICK SCREEN */}
         {activeTab === "seats" && seatLayout && (
           <div className="space-y-4 sm:space-y-6 pb-24 sm:pb-12">
-            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 bg-slate-900 border border-slate-800 p-4 sm:p-5 rounded-2xl sm:rounded-3xl">
-              <div>
-                <button
-                  onClick={() => setActiveTab("detail")}
-                  className="text-xs text-rose-400 font-semibold mb-1 inline-flex items-center gap-1 cursor-pointer"
-                >
-                  <ArrowLeft className="w-3.5 h-3.5" /> Change Showtime
-                </button>
-                <h2 className="text-base sm:text-xl font-black text-white">
-                  {seatLayout.movie_title}
-                </h2>
-                <p className="text-[11px] sm:text-xs text-slate-400">
-                  {seatLayout.theater_name} • {seatLayout.screen_name} •{" "}
-                  <span className="text-emerald-400 font-bold">
-                    ₹{seatLayout.ticket_price}/seat
+            {bookingConfirmedData ? (
+              /* Animated Tick Confirmation Screen right after Payment */
+              <div className="max-w-lg mx-auto bg-slate-900 border-2 border-emerald-500/60 rounded-3xl p-6 sm:p-8 text-center space-y-6 shadow-2xl my-4">
+                <div className="w-20 h-20 rounded-full bg-emerald-500/20 border-2 border-emerald-400 flex items-center justify-center mx-auto shadow-lg shadow-emerald-500/30 animate-bounce">
+                  <CheckCircle2 className="w-12 h-12 text-emerald-400" />
+                </div>
+
+                <div className="space-y-1">
+                  <span className="text-[11px] uppercase tracking-widest text-emerald-400 font-black">
+                    Payment Verified • Booking Confirmed
                   </span>
-                </p>
-              </div>
+                  <h2 className="text-2xl sm:text-3xl font-black text-white">
+                    Tickets Booked Successfully!
+                  </h2>
+                  <p className="text-xs text-slate-400">
+                    Your official PDF e-ticket and QR pass have been generated.
+                  </p>
+                </div>
 
-              <div className="grid grid-cols-2 sm:flex sm:flex-wrap items-center gap-2 sm:gap-4 text-[11px] font-semibold pt-2 sm:pt-0 border-t sm:border-t-0 border-slate-800">
-                <span className="flex items-center gap-1.5">
-                  <span className="w-3.5 h-3.5 rounded bg-slate-950 border border-slate-600 inline-block" />{" "}
-                  Available ({seatLayout.summary.available_seats})
-                </span>
-                <span className="flex items-center gap-1.5">
-                  <span className="w-3.5 h-3.5 rounded bg-emerald-500 inline-block" />{" "}
-                  Selected ({selectedSeats.length})
-                </span>
-                <span className="flex items-center gap-1.5">
-                  <span className="w-3.5 h-3.5 rounded bg-amber-500/30 border border-amber-500 inline-block" />{" "}
-                  Held ({seatLayout.summary.reserved_seats})
-                </span>
-                <span className="flex items-center gap-1.5">
-                  <span className="w-3.5 h-3.5 rounded bg-rose-900/60 border border-rose-700 inline-block" />{" "}
-                  Booked ({seatLayout.summary.booked_seats})
-                </span>
-              </div>
-            </div>
-
-            {/* Mobile Swipe Hint */}
-            <div className="sm:hidden flex items-center justify-center gap-1.5 text-[11px] text-slate-400 bg-slate-900/70 py-1.5 rounded-xl border border-slate-800">
-              <MoveHorizontal className="w-3.5 h-3.5 text-rose-400" /> Swipe
-              left/right to view all seats
-            </div>
-
-            <div className="text-center space-y-1.5 py-1">
-              <div className="w-4/5 max-w-2xl mx-auto h-2.5 bg-gradient-to-r from-transparent via-rose-500 to-transparent rounded-full shadow-[0_12px_35px_rgba(244,63,94,0.6)]" />
-              <p className="text-[10px] uppercase tracking-[0.2em] text-slate-400 font-semibold">
-                IMAX Screen This Way
-              </p>
-            </div>
-
-            <div className="bg-slate-900/90 border border-slate-800 rounded-2xl sm:rounded-3xl p-4 sm:p-8 overflow-x-auto shadow-inner">
-              <div className="min-w-[560px] space-y-2 flex flex-col items-center">
-                {seatLayout.seat_map.map((row) => (
-                  <div
-                    key={row.row_label}
-                    className="flex items-center gap-1.5 sm:gap-2"
-                  >
-                    <span className="w-5 text-[11px] font-extrabold text-slate-400 text-center">
-                      {row.row_label}
-                    </span>
-                    {row.seats.map((s, idx) => {
-                      const isSelected = selectedSeats.some(
-                        (sel) => sel.code === s.seat_code,
-                      );
-                      let btnClass =
-                        "bg-slate-950 border-slate-700 text-slate-300 hover:border-rose-400 cursor-pointer";
-                      if (s.status === "BOOKED")
-                        btnClass =
-                          "bg-rose-950/60 border-rose-800/70 text-rose-400/50 cursor-not-allowed";
-                      else if (s.status === "RESERVED")
-                        btnClass =
-                          "bg-amber-500/20 border-amber-500 text-amber-300 cursor-not-allowed";
-                      else if (isSelected)
-                        btnClass =
-                          "bg-emerald-500 border-emerald-300 text-slate-950 font-black scale-105 shadow-md shadow-emerald-500/30 cursor-pointer";
-
-                      return (
-                        <React.Fragment key={s.seat_code}>
-                          {idx === 6 && <span className="w-4 sm:w-5" />}
-                          <button
-                            onClick={() =>
-                              toggleSeatSelection(
-                                s.row_label,
-                                s.seat_number,
-                                s.status,
-                              )
-                            }
-                            disabled={
-                              s.status !== "AVAILABLE" || Boolean(activeBooking)
-                            }
-                            className={`w-7 h-7 sm:w-8 sm:h-8 rounded-t-lg rounded-b-sm border text-[10px] sm:text-[11px] transition-all ${btnClass}`}
-                          >
-                            {s.seat_number}
-                          </button>
-                        </React.Fragment>
-                      );
-                    })}
-                    <span className="w-5 text-[11px] font-extrabold text-slate-400 text-center">
-                      {row.row_label}
+                {/* Booked Ticket Summary Card */}
+                <div className="bg-slate-950 border border-slate-800 rounded-2xl p-5 text-left space-y-3">
+                  <div className="flex items-start justify-between border-b border-slate-800 pb-3">
+                    <div>
+                      <h3 className="font-black text-base sm:text-lg text-white">
+                        {bookingConfirmedData.movie_title}
+                      </h3>
+                      <p className="text-xs text-slate-400">
+                        {bookingConfirmedData.theater_name} •{" "}
+                        {bookingConfirmedData.screen_name}
+                      </p>
+                    </div>
+                    <span className="bg-emerald-950 text-emerald-400 border border-emerald-700 px-2.5 py-1 rounded-full text-[10px] font-extrabold">
+                      CONFIRMED
                     </span>
                   </div>
-                ))}
-              </div>
-            </div>
 
-            {/* Sticky Checkout Footer */}
-            <div className="fixed bottom-14 sm:bottom-4 left-2 right-2 sm:static z-30 bg-slate-900/95 backdrop-blur-xl border-2 border-slate-700 sm:border-slate-800 rounded-2xl sm:rounded-3xl p-3.5 sm:p-6 shadow-2xl flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-              <div className="flex sm:block items-center justify-between">
-                <p className="text-xs sm:text-sm font-bold truncate max-w-[200px] sm:max-w-none">
-                  Seats:{" "}
-                  <span className="text-emerald-400 font-black">
-                    {selectedSeats.map((s) => s.code).join(", ") || "None"}
-                  </span>
-                </p>
-                <p className="text-xs text-slate-400">
-                  Total:{" "}
-                  <strong className="text-white text-sm sm:text-base">
-                    ₹
-                    {(
-                      selectedSeats.length * seatLayout.ticket_price
-                    ).toLocaleString()}
-                  </strong>
-                </p>
-              </div>
+                  <div className="grid grid-cols-2 gap-3 text-xs">
+                    <div>
+                      <span className="text-slate-500 block text-[10px] uppercase">
+                        Booked Seats
+                      </span>
+                      <strong className="text-emerald-400 text-sm">
+                        {bookingConfirmedData.seats.join(", ")}
+                      </strong>
+                    </div>
+                    <div>
+                      <span className="text-slate-500 block text-[10px] uppercase">
+                        Amount Paid
+                      </span>
+                      <strong className="text-white text-sm">
+                        ₹{bookingConfirmedData.total_amount}
+                      </strong>
+                    </div>
+                    <div className="col-span-2">
+                      <span className="text-slate-500 block text-[10px] uppercase">
+                        Booking Reference
+                      </span>
+                      <span className="font-mono text-slate-300 text-[11px]">
+                        #
+                        {bookingConfirmedData.booking_id
+                          .slice(0, 8)
+                          .toUpperCase()}{" "}
+                        ({bookingConfirmedData.payment_ref})
+                      </span>
+                    </div>
+                  </div>
+                </div>
 
-              {!activeBooking ? (
-                <button
-                  onClick={handleReserveSeats}
-                  disabled={submitting || selectedSeats.length === 0}
-                  className="w-full sm:w-auto px-5 py-3 bg-gradient-to-r from-rose-600 to-rose-500 disabled:opacity-40 rounded-xl sm:rounded-2xl font-bold text-xs sm:text-sm flex items-center justify-center gap-2 shadow-xl shadow-rose-600/25 cursor-pointer"
-                >
-                  <Lock className="w-4 h-4" />
-                  {submitting ? "Locking..." : "Lock Seats (2m Hold) & Pay"}
-                </button>
-              ) : (
-                <div className="flex flex-wrap items-center gap-2 w-full sm:w-auto">
-                  <span className="px-3 py-1.5 rounded-xl bg-amber-950 border border-amber-500 text-amber-300 text-[11px] font-black flex items-center gap-1.5">
-                    <Clock className="w-3.5 h-3.5 animate-spin" />{" "}
-                    {formatTime(countdown)}
-                  </span>
+                <div className="flex flex-col sm:flex-row gap-3">
                   <button
-                    onClick={() => handleVerifyPayment("SUCCESS")}
-                    disabled={submitting}
-                    className="flex-1 sm:flex-initial px-4 py-2.5 bg-emerald-600 hover:bg-emerald-500 rounded-xl font-bold text-xs text-white flex items-center justify-center gap-1.5 shadow-lg cursor-pointer"
+                    onClick={() =>
+                      handleDownloadTicket(bookingConfirmedData.booking_id)
+                    }
+                    className="flex-1 py-3 bg-indigo-600 hover:bg-indigo-500 rounded-xl font-bold text-xs sm:text-sm text-white flex items-center justify-center gap-2 shadow-lg shadow-indigo-600/25 cursor-pointer"
                   >
-                    <CreditCard className="w-3.5 h-3.5" /> Pay ₹
-                    {activeBooking.total_amount}
+                    <Download className="w-4 h-4" /> Download PDF Ticket
                   </button>
                   <button
-                    onClick={() => handleVerifyPayment("FAILED")}
-                    disabled={submitting}
-                    className="px-3 py-2.5 bg-rose-950 border border-rose-700 rounded-xl font-bold text-[11px] text-rose-200 cursor-pointer"
+                    onClick={() => setQrModalTicket(bookingConfirmedData)}
+                    className="flex-1 py-3 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-xl font-bold text-xs sm:text-sm text-emerald-400 flex items-center justify-center gap-2 cursor-pointer"
                   >
-                    Fail Test
-                  </button>
-                  <button
-                    onClick={handleReleaseHold}
-                    className="px-2 py-2 text-[11px] text-slate-400 hover:text-white cursor-pointer"
-                  >
-                    Cancel
+                    <QrCode className="w-4 h-4" /> View QR Pass
                   </button>
                 </div>
-              )}
-            </div>
+
+                <button
+                  onClick={() => {
+                    setBookingConfirmedData(null);
+                    setActiveTab("bookings");
+                  }}
+                  className="w-full py-2.5 text-xs font-bold text-rose-400 hover:text-rose-300 cursor-pointer"
+                >
+                  Go to All My Booked Tickets →
+                </button>
+              </div>
+            ) : (
+              <>
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 bg-slate-900 border border-slate-800 p-4 sm:p-5 rounded-2xl sm:rounded-3xl">
+                  <div>
+                    <button
+                      onClick={() => setActiveTab("detail")}
+                      className="text-xs text-rose-400 font-semibold mb-1 inline-flex items-center gap-1 cursor-pointer"
+                    >
+                      <ArrowLeft className="w-3.5 h-3.5" /> Change Showtime
+                    </button>
+                    <h2 className="text-base sm:text-xl font-black text-white">
+                      {seatLayout.movie_title}
+                    </h2>
+                    <p className="text-[11px] sm:text-xs text-slate-400">
+                      {seatLayout.theater_name} • {seatLayout.screen_name} •{" "}
+                      <span className="text-emerald-400 font-bold">
+                        ₹{seatLayout.ticket_price}/seat
+                      </span>
+                    </p>
+                  </div>
+
+                  <div className="grid grid-cols-2 sm:flex sm:flex-wrap items-center gap-2 sm:gap-4 text-[11px] font-semibold pt-2 sm:pt-0 border-t sm:border-t-0 border-slate-800">
+                    <span className="flex items-center gap-1.5">
+                      <span className="w-3.5 h-3.5 rounded bg-slate-950 border border-slate-600 inline-block" />{" "}
+                      Available ({seatLayout.summary.available_seats})
+                    </span>
+                    <span className="flex items-center gap-1.5">
+                      <span className="w-3.5 h-3.5 rounded bg-emerald-500 inline-block" />{" "}
+                      Selected ({selectedSeats.length})
+                    </span>
+                    <span className="flex items-center gap-1.5">
+                      <span className="w-3.5 h-3.5 rounded bg-amber-500/30 border border-amber-500 inline-block" />{" "}
+                      Held ({seatLayout.summary.reserved_seats})
+                    </span>
+                    <span className="flex items-center gap-1.5">
+                      <span className="w-3.5 h-3.5 rounded bg-rose-900/60 border border-rose-700 inline-block" />{" "}
+                      Booked ({seatLayout.summary.booked_seats})
+                    </span>
+                  </div>
+                </div>
+
+                <div className="sm:hidden flex items-center justify-center gap-1.5 text-[11px] text-slate-400 bg-slate-900/70 py-1.5 rounded-xl border border-slate-800">
+                  <MoveHorizontal className="w-3.5 h-3.5 text-rose-400" /> Swipe
+                  left/right to view all seats
+                </div>
+
+                <div className="text-center space-y-1.5 py-1">
+                  <div className="w-4/5 max-w-2xl mx-auto h-2.5 bg-gradient-to-r from-transparent via-rose-500 to-transparent rounded-full shadow-[0_12px_35px_rgba(244,63,94,0.6)]" />
+                  <p className="text-[10px] uppercase tracking-[0.2em] text-slate-400 font-semibold">
+                    IMAX Screen This Way
+                  </p>
+                </div>
+
+                <div className="bg-slate-900/90 border border-slate-800 rounded-2xl sm:rounded-3xl p-4 sm:p-8 overflow-x-auto shadow-inner">
+                  <div className="min-w-[560px] space-y-2 flex flex-col items-center">
+                    {seatLayout.seat_map.map((row) => (
+                      <div
+                        key={row.row_label}
+                        className="flex items-center gap-1.5 sm:gap-2"
+                      >
+                        <span className="w-5 text-[11px] font-extrabold text-slate-400 text-center">
+                          {row.row_label}
+                        </span>
+                        {row.seats.map((s, idx) => {
+                          const isSelected = selectedSeats.some(
+                            (sel) => sel.code === s.seat_code,
+                          );
+                          let btnClass =
+                            "bg-slate-950 border-slate-700 text-slate-300 hover:border-rose-400 cursor-pointer";
+                          if (s.status === "BOOKED")
+                            btnClass =
+                              "bg-rose-950/60 border-rose-800/70 text-rose-400/50 cursor-not-allowed";
+                          else if (s.status === "RESERVED")
+                            btnClass =
+                              "bg-amber-500/20 border-amber-500 text-amber-300 cursor-not-allowed";
+                          else if (isSelected)
+                            btnClass =
+                              "bg-emerald-500 border-emerald-300 text-slate-950 font-black scale-105 shadow-md shadow-emerald-500/30 cursor-pointer";
+
+                          return (
+                            <React.Fragment key={s.seat_code}>
+                              {idx === 6 && <span className="w-4 sm:w-5" />}
+                              <button
+                                onClick={() =>
+                                  toggleSeatSelection(
+                                    s.row_label,
+                                    s.seat_number,
+                                    s.status,
+                                  )
+                                }
+                                disabled={
+                                  s.status !== "AVAILABLE" ||
+                                  Boolean(activeBooking)
+                                }
+                                className={`w-7 h-7 sm:w-8 sm:h-8 rounded-t-lg rounded-b-sm border text-[10px] sm:text-[11px] transition-all ${btnClass}`}
+                              >
+                                {s.seat_number}
+                              </button>
+                            </React.Fragment>
+                          );
+                        })}
+                        <span className="w-5 text-[11px] font-extrabold text-slate-400 text-center">
+                          {row.row_label}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Sticky Checkout Footer with GST & Fee Breakdown */}
+                <div className="fixed bottom-14 sm:bottom-4 left-2 right-2 sm:static z-30 bg-slate-900/95 backdrop-blur-xl border-2 border-slate-700 sm:border-slate-800 rounded-2xl sm:rounded-3xl p-3.5 sm:p-6 shadow-2xl flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                  <div className="space-y-0.5">
+                    <div className="flex sm:block items-center justify-between">
+                      <p className="text-xs sm:text-sm font-bold truncate max-w-[200px] sm:max-w-none">
+                        Seats:{" "}
+                        <span className="text-emerald-400 font-black">
+                          {selectedSeats.map((s) => s.code).join(", ") ||
+                            "None"}
+                        </span>
+                      </p>
+                      <p className="text-xs text-slate-300">
+                        Ticket Price:{" "}
+                        <strong className="text-white text-sm sm:text-base">
+                          ₹{baseSeatSubtotal.toLocaleString()}
+                        </strong>
+                      </p>
+                    </div>
+                    {selectedSeats.length > 0 && (
+                      <p className="text-[10px] text-slate-400">
+                        Includes Convenience Fee ₹{convenienceFee} + 18% GST (₹
+                        {gstAmount})
+                      </p>
+                    )}
+                  </div>
+
+                  {!activeBooking ? (
+                    <button
+                      onClick={handleReserveSeats}
+                      disabled={submitting || selectedSeats.length === 0}
+                      className="w-full sm:w-auto px-5 py-3 bg-gradient-to-r from-rose-600 to-rose-500 disabled:opacity-40 rounded-xl sm:rounded-2xl font-bold text-xs sm:text-sm flex items-center justify-center gap-2 shadow-xl shadow-rose-600/25 cursor-pointer"
+                    >
+                      {submitting ? (
+                        <Loader2 className="w-4 h-4 animate-spin" />
+                      ) : (
+                        <Lock className="w-4 h-4" />
+                      )}
+                      {submitting
+                        ? "Locking Seats..."
+                        : "Lock Seats (2m Hold) & Pay"}
+                    </button>
+                  ) : (
+                    <div className="flex flex-wrap items-center gap-2 w-full sm:w-auto">
+                      <span className="px-3 py-1.5 rounded-xl bg-amber-950 border border-amber-500 text-amber-300 text-[11px] font-black flex items-center gap-1.5">
+                        <Clock className="w-3.5 h-3.5 animate-spin" />{" "}
+                        {formatTime(countdown)}
+                      </span>
+                      <button
+                        onClick={() => handleVerifyPayment("SUCCESS")}
+                        disabled={submitting}
+                        className="flex-1 sm:flex-initial px-4 py-2.5 bg-emerald-600 hover:bg-emerald-500 rounded-xl font-bold text-xs text-white flex items-center justify-center gap-1.5 shadow-lg cursor-pointer"
+                      >
+                        {submitting ? (
+                          <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                        ) : (
+                          <CreditCard className="w-3.5 h-3.5" />
+                        )}
+                        Pay ₹{activeBooking.total_amount}
+                      </button>
+                      <button
+                        onClick={() => handleVerifyPayment("FAILED")}
+                        disabled={submitting}
+                        className="px-3 py-2.5 bg-rose-950 border border-rose-700 rounded-xl font-bold text-[11px] text-rose-200 cursor-pointer"
+                      >
+                        Fail Test
+                      </button>
+                      <button
+                        onClick={handleReleaseHold}
+                        className="px-2 py-2 text-[11px] text-slate-400 hover:text-white cursor-pointer"
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  )}
+                </div>
+              </>
+            )}
           </div>
         )}
 
@@ -1413,7 +1759,7 @@ export default function App() {
                   My Digital Tickets
                 </h2>
                 <p className="text-[11px] sm:text-xs text-slate-400">
-                  Download official PDF tickets with QR verification
+                  View on-screen QR pass or download official PDF tickets
                 </p>
               </div>
               <button
@@ -1493,12 +1839,20 @@ export default function App() {
                         ID: #{b.booking_id.slice(0, 8)}
                       </span>
                       {b.status === "CONFIRMED" && (
-                        <button
-                          onClick={() => handleDownloadTicket(b.booking_id)}
-                          className="px-3.5 py-2 bg-indigo-600 hover:bg-indigo-500 rounded-xl text-xs font-bold text-white flex items-center gap-1.5 cursor-pointer"
-                        >
-                          <Download className="w-3.5 h-3.5" /> PDF Ticket
-                        </button>
+                        <div className="flex items-center gap-2">
+                          <button
+                            onClick={() => setQrModalTicket(b)}
+                            className="px-3 py-2 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-xl text-xs font-bold text-emerald-400 flex items-center gap-1.5 cursor-pointer"
+                          >
+                            <QrCode className="w-3.5 h-3.5" /> QR Pass
+                          </button>
+                          <button
+                            onClick={() => handleDownloadTicket(b.booking_id)}
+                            className="px-3.5 py-2 bg-indigo-600 hover:bg-indigo-500 rounded-xl text-xs font-bold text-white flex items-center gap-1.5 cursor-pointer"
+                          >
+                            <Download className="w-3.5 h-3.5" /> PDF
+                          </button>
+                        </div>
                       )}
                     </div>
                   </div>
@@ -1711,46 +2065,56 @@ export default function App() {
               <input
                 type="text"
                 required
+                disabled={authLoading}
                 placeholder="Username"
                 value={authForm.username}
                 onChange={(e) =>
                   setAuthForm({ ...authForm, username: e.target.value })
                 }
-                className="w-full bg-slate-950 border border-slate-800 rounded-xl px-4 py-3 text-sm outline-none focus:border-rose-500"
+                className="w-full bg-slate-950 border border-slate-800 rounded-xl px-4 py-3 text-sm outline-none focus:border-rose-500 disabled:opacity-50"
               />
               {authForm.action === "register" && (
                 <input
                   type="email"
                   required
+                  disabled={authLoading}
                   placeholder="Email address"
                   value={authForm.email}
                   onChange={(e) =>
                     setAuthForm({ ...authForm, email: e.target.value })
                   }
-                  className="w-full bg-slate-950 border border-slate-800 rounded-xl px-4 py-3 text-sm outline-none focus:border-rose-500"
+                  className="w-full bg-slate-950 border border-slate-800 rounded-xl px-4 py-3 text-sm outline-none focus:border-rose-500 disabled:opacity-50"
                 />
               )}
               <input
                 type="password"
                 required
+                disabled={authLoading}
                 placeholder="Password"
                 value={authForm.password}
                 onChange={(e) =>
                   setAuthForm({ ...authForm, password: e.target.value })
                 }
-                className="w-full bg-slate-950 border border-slate-800 rounded-xl px-4 py-3 text-sm outline-none focus:border-rose-500"
+                className="w-full bg-slate-950 border border-slate-800 rounded-xl px-4 py-3 text-sm outline-none focus:border-rose-500 disabled:opacity-50"
               />
             </div>
 
             <button
               type="submit"
-              className="w-full py-3 bg-gradient-to-r from-rose-600 to-rose-500 rounded-xl font-bold text-sm shadow-lg shadow-rose-600/25 cursor-pointer"
+              disabled={authLoading}
+              className="w-full py-3 bg-gradient-to-r from-rose-600 to-rose-500 disabled:opacity-60 rounded-xl font-bold text-sm shadow-lg shadow-rose-600/25 flex items-center justify-center gap-2 cursor-pointer"
             >
-              {authForm.action === "login" ? "Sign In" : "Create Account"}
+              {authLoading && <Loader2 className="w-4 h-4 animate-spin" />}
+              {authLoading
+                ? "Signing In..."
+                : authForm.action === "login"
+                  ? "Sign In"
+                  : "Create Account"}
             </button>
 
             <button
               type="button"
+              disabled={authLoading}
               onClick={() =>
                 setAuthForm({
                   ...authForm,
