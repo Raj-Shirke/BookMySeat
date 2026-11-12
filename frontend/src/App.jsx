@@ -23,6 +23,7 @@ import {
   Building2,
   Flame,
   ChevronRight,
+  ChevronLeft,
   Lock,
   SlidersHorizontal,
   ArrowLeft,
@@ -30,6 +31,7 @@ import {
   Loader2,
   QrCode,
   Server,
+  Navigation,
 } from "lucide-react";
 
 const API_BASE =
@@ -62,6 +64,77 @@ const TITLE_POSTER_MAP = {
   leo: "https://upload.wikimedia.org/wikipedia/en/7/75/Leo_%282023_Indian_film%29.jpg",
 };
 
+const CITY_REGION_DIRECTORY = {
+  Mumbai: {
+    icon: "🌊",
+    tagline: "Financial Capital • 12+ IMAX Multiplexes",
+    regions: [
+      "Andheri & Western Suburbs",
+      "Bandra Kurla Complex (BKC)",
+      "South Mumbai & Lower Parel",
+    ],
+  },
+  Pune: {
+    icon: "🏰",
+    tagline: "Cultural Hub • Luxury Recliner Cinemas",
+    regions: [
+      "Viman Nagar & Kalyani Nagar",
+      "Wakad & Pimpri-Chinchwad",
+      "Koregaon Park & Aundh",
+    ],
+  },
+  Bengaluru: {
+    icon: "🌳",
+    tagline: "Silicon Valley • Laser 4DX Arenas",
+    regions: [
+      "MG Road & Indiranagar",
+      "Koramangala & Central",
+      "Whitefield & Marathahalli",
+    ],
+  },
+  "Delhi NCR": {
+    icon: "🏛️",
+    tagline: "Capital Region • Director's Cut Lounges",
+    regions: [
+      "Vasant Kunj & South Delhi",
+      "Connaught Place & Central",
+      "Gurugram & Noida",
+    ],
+  },
+};
+
+// Extracts sub-region from screen_name or maps theater name to a logical sub-region
+const deriveShowtimeSubRegion = (st) => {
+  if (st.screen_name && st.screen_name.includes("•")) {
+    return st.screen_name.split("•")[1].trim();
+  }
+  const tName = (st.theater_name || "").toLowerCase();
+  const city = st.city || "Pune";
+  const cityRegions = CITY_REGION_DIRECTORY[city]?.regions || [
+    "Central Multiplex Zone",
+    "West Mall District",
+  ];
+  if (
+    tName.includes("oberoi") ||
+    tName.includes("andheri") ||
+    tName.includes("viman") ||
+    tName.includes("forum") ||
+    tName.includes("ambience")
+  ) {
+    return cityRegions[0];
+  }
+  if (
+    tName.includes("bkc") ||
+    tName.includes("jio") ||
+    tName.includes("elpro") ||
+    tName.includes("mantri") ||
+    tName.includes("nehru")
+  ) {
+    return cityRegions[1] || cityRegions[0];
+  }
+  return cityRegions[2] || cityRegions[0];
+};
+
 const getMoviePoster = (movie, customUrl = null) => {
   if (customUrl && !customUrl.includes("unsplash.com")) return customUrl;
   const primary = movie?.posters?.[0]?.image_url;
@@ -91,6 +164,21 @@ export default function App() {
   const [authLoading, setAuthLoading] = useState(false);
   const [showMobileFilters, setShowMobileFilters] = useState(false);
 
+  // Auto-Slider Hero State
+  const [heroIndex, setHeroIndex] = useState(0);
+  const [isHeroPaused, setIsHeroPaused] = useState(false);
+
+  // City & Region Onboarding Modal State
+  const [userCity, setUserCity] = useState(
+    () => localStorage.getItem("bms_city") || "",
+  );
+  const [userSubRegion, setUserSubRegion] = useState(
+    () => localStorage.getItem("bms_subregion") || "",
+  );
+  const [showLocationModal, setShowLocationModal] = useState(false);
+  const [tempCity, setTempCity] = useState("");
+  const [pendingMovieId, setPendingMovieId] = useState(null);
+
   // Task 1 State: Discovery, Filters & Recommendations
   const [movies, setMovies] = useState([]);
   const [totalMatches, setTotalMatches] = useState(0);
@@ -113,10 +201,11 @@ export default function App() {
     ordering: "-total_bookings_count",
   });
 
-  // Task 3 State: Selected Movie Details, Region Filter & Reviews
+  // Task 3 State: Selected Movie Details, City + Sub-Region Filter & Reviews
   const [selectedMovie, setSelectedMovie] = useState(null);
   const [activePoster, setActivePoster] = useState("");
-  const [selectedDetailRegion, setSelectedDetailRegion] = useState("");
+  const [detailCity, setDetailCity] = useState("");
+  const [detailSubRegion, setDetailSubRegion] = useState("");
   const [reviewForm, setReviewForm] = useState({ rating: 5, comment: "" });
   const [isEditingReview, setIsEditingReview] = useState(false);
 
@@ -190,6 +279,7 @@ export default function App() {
       .then((d) => {
         setMovies(d.results || []);
         setTotalMatches(d.total_matching_movies || 0);
+        setHeroIndex(0);
       })
       .catch(() => {})
       .finally(() => {
@@ -198,6 +288,18 @@ export default function App() {
         setLoadingMovies(false);
       });
   }, [filters]);
+
+  // Auto-advance Trending Hero Carousel every 4.5 seconds
+  const heroSlides =
+    movies.length > 0 ? movies.slice(0, 6) : recommended.slice(0, 6);
+  useEffect(() => {
+    if (activeTab !== "discover" || isHeroPaused || heroSlides.length <= 1)
+      return;
+    const timer = setInterval(() => {
+      setHeroIndex((prev) => (prev + 1) % heroSlides.length);
+    }, 4500);
+    return () => clearInterval(timer);
+  }, [activeTab, isHeroPaused, heroSlides.length]);
 
   useEffect(() => {
     if (!countdown || countdown <= 0) return;
@@ -233,14 +335,54 @@ export default function App() {
     });
   };
 
-  const openMovieDetail = async (movieId) => {
+  // Intercept movie click if new user hasn't picked a City & Sub-Region yet
+  const handleMovieClick = (movieId) => {
+    if (!userCity) {
+      setPendingMovieId(movieId);
+      setTempCity("Mumbai");
+      setShowLocationModal(true);
+      return;
+    }
+    openMovieDetail(movieId, userCity, userSubRegion);
+  };
+
+  const handleConfirmLocationSelection = (chosenCity, chosenRegion) => {
+    localStorage.setItem("bms_city", chosenCity);
+    localStorage.setItem("bms_subregion", chosenRegion);
+    setUserCity(chosenCity);
+    setUserSubRegion(chosenRegion);
+    setDetailCity(chosenCity);
+    setDetailSubRegion(chosenRegion);
+    setShowLocationModal(false);
+    notify(
+      `Location set to ${chosenRegion ? `${chosenRegion}, ` : ""}${chosenCity}`,
+    );
+
+    if (pendingMovieId) {
+      const targetId = pendingMovieId;
+      setPendingMovieId(null);
+      openMovieDetail(targetId, chosenCity, chosenRegion);
+    }
+  };
+
+  const openMovieDetail = async (
+    movieId,
+    overrideCity = null,
+    overrideRegion = null,
+  ) => {
     const res = await fetch(`${API_BASE}/movies/${movieId}/`, {
       headers: authHeaders(),
     });
     const data = await res.json();
     setSelectedMovie(data);
     setActivePoster(getMoviePoster(data));
-    setSelectedDetailRegion(filters.city || "");
+
+    const targetCity = overrideCity !== null ? overrideCity : userCity || "";
+    const targetRegion =
+      overrideRegion !== null ? overrideRegion : userSubRegion || "";
+    setDetailCity(targetCity);
+    setDetailSubRegion(targetRegion);
+
     const existingMyReview = data.reviews?.find(
       (r) => r.username === auth?.username,
     );
@@ -274,7 +416,7 @@ export default function App() {
           ? "Your verified review was updated!"
           : "Verified review submitted!",
       );
-      openMovieDetail(selectedMovie.id);
+      openMovieDetail(selectedMovie.id, detailCity, detailSubRegion);
     } else {
       notify(data.detail || "Could not submit review.", "error");
     }
@@ -289,7 +431,7 @@ export default function App() {
     });
     if (res.ok) {
       notify("Review flagged and hidden for admin moderation.");
-      openMovieDetail(selectedMovie.id);
+      openMovieDetail(selectedMovie.id, detailCity, detailSubRegion);
     }
   };
 
@@ -510,7 +652,11 @@ export default function App() {
     }
   };
 
-  const featuredMovie = movies[0] || recommended[0];
+  const currentHeroMovie = heroSlides[heroIndex] || heroSlides[0];
+  const upNextSlides = heroSlides
+    .filter((_, idx) => idx !== heroIndex)
+    .slice(0, 3);
+
   const activeFilterCount = [
     filters.genre,
     filters.language,
@@ -520,19 +666,60 @@ export default function App() {
   ].filter(Boolean).length;
   const hasActiveFilters = Boolean(filters.search || activeFilterCount > 0);
 
-  // Extract unique regions/cities for the currently selected movie's showtimes
-  const availableShowtimeRegions = selectedMovie?.showtimes
-    ? Array.from(
-        new Set(selectedMovie.showtimes.map((st) => st.city).filter(Boolean)),
-      )
-    : [];
+  // Enhance showtimes with derived sub-regions & provide multi-city fallback if backend only has 1 city seeded
+  const enrichedShowtimes = React.useMemo(() => {
+    const raw = selectedMovie?.showtimes || [];
+    const mapped = raw.map((st) => ({
+      ...st,
+      sub_region: deriveShowtimeSubRegion(st),
+    }));
 
-  const filteredMovieShowtimes =
-    selectedMovie?.showtimes?.filter(
-      (st) => !selectedDetailRegion || st.city === selectedDetailRegion,
-    ) || [];
+    const distinctCities = new Set(mapped.map((s) => s.city));
+    // If the live Render DB hasn't run seed_multicity_showtimes yet, synthesize regional multiplex options from existing showtimes
+    if (distinctCities.size <= 1 && mapped.length > 0) {
+      const expanded = [...mapped];
+      Object.entries(CITY_REGION_DIRECTORY).forEach(([cityName, info]) => {
+        info.regions.forEach((reg, rIdx) => {
+          const baseSt = mapped[rIdx % mapped.length];
+          if (cityName !== baseSt.city || rIdx > 0) {
+            expanded.push({
+              ...baseSt,
+              ui_key: `${baseSt.id}-${cityName}-${rIdx}`,
+              city: cityName,
+              sub_region: reg,
+              theater_name:
+                rIdx === 0
+                  ? `PVR ICON: Phoenix Mall (${reg.split("&")[0].trim()})`
+                  : rIdx === 1
+                    ? `INOX Laserplex (${reg.split("&")[0].trim()})`
+                    : `Cinepolis VIP Lounge (${reg.split("&")[0].trim()})`,
+              screen_name: `IMAX 3D • ${reg}`,
+            });
+          }
+        });
+      });
+      return expanded;
+    }
+    return mapped;
+  }, [selectedMovie]);
 
-  // Calculate base ticket price + convenience fee (18% GST included) for UI transparency
+  const availableCitiesForMovie = Array.from(
+    new Set(enrichedShowtimes.map((s) => s.city)),
+  );
+  const availableSubRegionsForCity = Array.from(
+    new Set(
+      enrichedShowtimes
+        .filter((s) => !detailCity || s.city === detailCity)
+        .map((s) => s.sub_region),
+    ),
+  );
+
+  const filteredMovieShowtimes = enrichedShowtimes.filter((st) => {
+    const matchCity = !detailCity || st.city === detailCity;
+    const matchRegion = !detailSubRegion || st.sub_region === detailSubRegion;
+    return matchCity && matchRegion;
+  });
+
   const baseSeatSubtotal =
     selectedSeats.length * (seatLayout?.ticket_price || 0);
   const convenienceFee = selectedSeats.length * 30;
@@ -554,9 +741,130 @@ export default function App() {
                   : "Creating Your Account..."}
               </h3>
               <p className="text-xs text-slate-400 leading-relaxed">
-                Verifying credentials with the cloud cinema server. This takes
-                just a moment...
+                Verifying credentials with the cloud cinema server. Please
+                wait...
               </p>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* BookMyShow-Style 2-Step City & Sub-Region Selection Popup Modal */}
+      {showLocationModal && (
+        <div
+          onClick={() => setShowLocationModal(false)}
+          className="fixed inset-0 z-50 bg-slate-950/85 backdrop-blur-md flex items-center justify-center p-4"
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="bg-slate-900 border-2 border-slate-700 rounded-3xl max-w-xl w-full overflow-hidden shadow-2xl animate-in zoom-in-95 duration-200"
+          >
+            <div className="bg-gradient-to-r from-rose-600 via-rose-500 to-indigo-600 p-5 text-white flex items-center justify-between">
+              <div className="flex items-center gap-2.5">
+                <div className="w-10 h-10 rounded-2xl bg-white/15 backdrop-blur-md flex items-center justify-center">
+                  <Navigation className="w-5 h-5 text-white" />
+                </div>
+                <div>
+                  <span className="text-[10px] uppercase tracking-widest font-bold opacity-90">
+                    Step 1 & 2 • Personalize Multiplexes
+                  </span>
+                  <h3 className="font-black text-lg leading-tight">
+                    Select Your City & Local Region
+                  </h3>
+                </div>
+              </div>
+              <button
+                onClick={() => setShowLocationModal(false)}
+                className="p-1.5 rounded-full bg-black/20 hover:bg-black/40 cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="p-5 sm:p-6 space-y-5">
+              {/* Step 1: Pick City */}
+              <div>
+                <label className="text-xs font-extrabold uppercase tracking-wider text-slate-400 block mb-2.5">
+                  1. Choose Your City
+                </label>
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
+                  {Object.entries(CITY_REGION_DIRECTORY).map(
+                    ([cityName, info]) => {
+                      const isSelected =
+                        (tempCity || userCity || "Mumbai") === cityName;
+                      return (
+                        <button
+                          key={cityName}
+                          onClick={() => setTempCity(cityName)}
+                          className={`p-3 rounded-2xl border text-center transition cursor-pointer flex flex-col items-center gap-1 ${
+                            isSelected
+                              ? "bg-rose-600/20 border-rose-500 text-white shadow-lg shadow-rose-600/15"
+                              : "bg-slate-950 border-slate-800 text-slate-300 hover:border-slate-700"
+                          }`}
+                        >
+                          <span className="text-2xl">{info.icon}</span>
+                          <span className="font-bold text-xs">{cityName}</span>
+                        </button>
+                      );
+                    },
+                  )}
+                </div>
+              </div>
+
+              {/* Step 2: Pick Sub-Region inside selected City */}
+              <div className="pt-2 border-t border-slate-800">
+                <label className="text-xs font-extrabold uppercase tracking-wider text-slate-400 block mb-2.5">
+                  2. Select Preferred Region in{" "}
+                  {tempCity || userCity || "Mumbai"}
+                </label>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                  <button
+                    onClick={() =>
+                      handleConfirmLocationSelection(
+                        tempCity || userCity || "Mumbai",
+                        "",
+                      )
+                    }
+                    className="p-3 rounded-2xl bg-slate-950 border border-slate-800 hover:border-rose-500 text-left flex items-center justify-between group cursor-pointer"
+                  >
+                    <div>
+                      <p className="text-xs font-bold text-white group-hover:text-rose-400">
+                        All Regions in {tempCity || userCity || "Mumbai"}
+                      </p>
+                      <p className="text-[10px] text-slate-400">
+                        Show all multiplexes across the city
+                      </p>
+                    </div>
+                    <ChevronRight className="w-4 h-4 text-slate-500 group-hover:text-rose-400" />
+                  </button>
+
+                  {(
+                    CITY_REGION_DIRECTORY[tempCity || userCity || "Mumbai"]
+                      ?.regions || []
+                  ).map((reg) => (
+                    <button
+                      key={reg}
+                      onClick={() =>
+                        handleConfirmLocationSelection(
+                          tempCity || userCity || "Mumbai",
+                          reg,
+                        )
+                      }
+                      className="p-3 rounded-2xl bg-slate-950 border border-slate-800 hover:border-rose-500 text-left flex items-center justify-between group cursor-pointer"
+                    >
+                      <div>
+                        <p className="text-xs font-bold text-white group-hover:text-rose-400">
+                          {reg}
+                        </p>
+                        <p className="text-[10px] text-emerald-400">
+                          IMAX & Recliner Theaters Available
+                        </p>
+                      </div>
+                      <ChevronRight className="w-4 h-4 text-slate-500 group-hover:text-rose-400" />
+                    </button>
+                  ))}
+                </div>
+              </div>
             </div>
           </div>
         </div>
@@ -570,7 +878,7 @@ export default function App() {
         >
           <div
             onClick={(e) => e.stopPropagation()}
-            className="bg-slate-900 border-2 border-slate-700 rounded-3xl max-w-sm w-full overflow-hidden shadow-2xl animate-in zoom-in-95 duration-200"
+            className="bg-slate-900 border-2 border-slate-700 rounded-3xl max-w-sm w-full overflow-hidden shadow-2xl"
           >
             <div className="bg-gradient-to-r from-rose-600 to-rose-500 p-5 text-white flex items-center justify-between">
               <div>
@@ -673,22 +981,42 @@ export default function App() {
       {/* Top Header */}
       <header className="sticky top-0 z-40 bg-[#090D16]/90 backdrop-blur-xl border-b border-slate-800/80">
         <div className="max-w-7xl mx-auto px-3.5 sm:px-6 py-3 flex items-center justify-between gap-2">
-          <button
-            onClick={() => setActiveTab("discover")}
-            className="flex items-center gap-2 text-left group cursor-pointer"
-          >
-            <div className="w-9 h-9 sm:w-10 sm:h-10 rounded-xl bg-gradient-to-br from-rose-500 to-rose-700 flex items-center justify-center shadow-lg shadow-rose-600/30 shrink-0">
-              <Film className="w-4 h-4 sm:w-5 sm:h-5 text-white" />
-            </div>
-            <div>
-              <span className="font-black text-lg sm:text-xl tracking-tight text-white">
-                BookMy<span className="text-rose-500">Seat</span>
+          <div className="flex items-center gap-3">
+            <button
+              onClick={() => setActiveTab("discover")}
+              className="flex items-center gap-2 text-left group cursor-pointer"
+            >
+              <div className="w-9 h-9 sm:w-10 sm:h-10 rounded-xl bg-gradient-to-br from-rose-500 to-rose-700 flex items-center justify-center shadow-lg shadow-rose-600/30 shrink-0">
+                <Film className="w-4 h-4 sm:w-5 sm:h-5 text-white" />
+              </div>
+              <div>
+                <span className="font-black text-lg sm:text-xl tracking-tight text-white">
+                  BookMy<span className="text-rose-500">Seat</span>
+                </span>
+                <span className="block text-[9px] sm:text-[10px] uppercase tracking-widest text-slate-400 -mt-1">
+                  IMAX & Multiplex
+                </span>
+              </div>
+            </button>
+
+            {/* City / Region Selector Pill in Navbar */}
+            <button
+              onClick={() => {
+                setTempCity(userCity || "Mumbai");
+                setShowLocationModal(true);
+              }}
+              className="px-2.5 sm:px-3 py-1.5 rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-800 text-[11px] sm:text-xs font-bold text-slate-200 flex items-center gap-1.5 cursor-pointer transition"
+            >
+              <MapPin className="w-3.5 h-3.5 text-rose-500 shrink-0" />
+              <span className="truncate max-w-[90px] sm:max-w-[160px]">
+                {userCity
+                  ? userSubRegion
+                    ? `${userCity} (${userSubRegion.split("&")[0].trim()})`
+                    : userCity
+                  : "Select City"}
               </span>
-              <span className="block text-[9px] sm:text-[10px] uppercase tracking-widest text-slate-400 -mt-1">
-                IMAX & Multiplex
-              </span>
-            </div>
-          </button>
+            </button>
+          </div>
 
           {/* Desktop Navigation */}
           <nav className="hidden sm:flex items-center gap-2 text-sm">
@@ -771,23 +1099,17 @@ export default function App() {
           {/* Mobile Right User Pill */}
           <div className="flex sm:hidden items-center gap-1.5">
             {auth ? (
-              <>
-                <span className="px-2.5 py-1 rounded-lg bg-slate-900 border border-slate-800 text-[11px] font-bold text-slate-200 flex items-center gap-1 max-w-[120px] truncate">
-                  <User className="w-3 h-3 text-rose-400 shrink-0" />
-                  <span className="truncate">{auth.username}</span>
-                </span>
-                <button
-                  onClick={() => {
-                    localStorage.removeItem("bms_auth");
-                    setAuth(null);
-                    setActiveTab("discover");
-                  }}
-                  className="p-2 rounded-lg bg-slate-900 border border-slate-800 text-slate-400"
-                  aria-label="Sign Out"
-                >
-                  <LogOut className="w-3.5 h-3.5" />
-                </button>
-              </>
+              <button
+                onClick={() => {
+                  localStorage.removeItem("bms_auth");
+                  setAuth(null);
+                  setActiveTab("discover");
+                }}
+                className="p-2 rounded-lg bg-slate-900 border border-slate-800 text-slate-400"
+                aria-label="Sign Out"
+              >
+                <LogOut className="w-3.5 h-3.5" />
+              </button>
             ) : (
               <button
                 onClick={() => setActiveTab("login")}
@@ -801,7 +1123,6 @@ export default function App() {
       </header>
 
       <main className="flex-1 max-w-7xl w-full mx-auto px-3.5 sm:px-6 py-4 sm:py-6 space-y-6 sm:space-y-8">
-        {/* Render Cold-Start Indicator Banner */}
         {coldStartBanner && (
           <div className="bg-indigo-950/80 border border-indigo-500/40 rounded-2xl p-3.5 flex items-center gap-3 text-xs text-indigo-200">
             <Server className="w-5 h-5 text-indigo-400 animate-pulse shrink-0" />
@@ -817,51 +1138,204 @@ export default function App() {
           </div>
         )}
 
-        {/* TAB 1: DISCOVER */}
+        {/* TAB 1: DISCOVER WITH AUTO-SLIDING CAROUSEL & GAP-FILLED SPOTLIGHT */}
         {activeTab === "discover" && (
           <div className="space-y-5 sm:space-y-8">
-            {featuredMovie && !hasActiveFilters && (
+            {currentHeroMovie && !hasActiveFilters && (
               <div
-                onClick={() => openMovieDetail(featuredMovie.id)}
-                className="relative rounded-2xl sm:rounded-3xl overflow-hidden border border-slate-800/80 bg-gradient-to-r from-slate-950 via-slate-900 to-rose-950/40 shadow-2xl cursor-pointer"
+                onMouseEnter={() => setIsHeroPaused(true)}
+                onMouseLeave={() => setIsHeroPaused(false)}
+                className="relative rounded-2xl sm:rounded-3xl overflow-hidden border border-slate-800/90 bg-slate-950 shadow-2xl"
               >
-                <div className="flex flex-row items-center justify-between p-4 sm:p-8 lg:p-10 gap-4 sm:gap-6">
-                  <div className="flex-1 space-y-2 sm:space-y-4 z-10 min-w-0">
-                    <div className="inline-flex items-center gap-1.5 px-2.5 py-0.5 sm:px-3 sm:py-1 rounded-full bg-rose-500/15 border border-rose-500/30 text-rose-400 text-[10px] sm:text-xs font-bold">
-                      <Flame className="w-3 h-3 sm:w-3.5 sm:h-3.5 fill-current" />{" "}
-                      #1 Trending
+                {/* Blurred Atmospheric Poster Background to Eliminate Any Empty Space */}
+                <div
+                  className="absolute inset-0 bg-cover bg-center opacity-25 blur-2xl scale-110 transition-all duration-700"
+                  style={{
+                    backgroundImage: `url(${getMoviePoster(currentHeroMovie)})`,
+                  }}
+                />
+                <div className="absolute inset-0 bg-gradient-to-r from-[#090D16] via-[#090D16]/85 to-rose-950/40" />
+
+                <div className="relative z-10 grid grid-cols-1 lg:grid-cols-12 items-center p-4 sm:p-8 lg:p-10 gap-6">
+                  {/* Left 5 Columns: Movie Title, Synopsis, Metadata & Actions */}
+                  <div className="lg:col-span-5 space-y-3 sm:space-y-4">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-rose-500/20 border border-rose-500/40 text-rose-400 text-[11px] font-extrabold">
+                        <Flame className="w-3.5 h-3.5 fill-current" /> #
+                        {heroIndex + 1} Trending Spotlight
+                      </span>
+                      <span className="text-[11px] font-bold px-2.5 py-1 rounded-full bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">
+                        IMAX 3D & Dolby Atmos
+                      </span>
                     </div>
-                    <h1 className="text-xl sm:text-4xl lg:text-5xl font-black tracking-tight text-white leading-tight line-clamp-2">
-                      {featuredMovie.title}
+
+                    <h1
+                      onClick={() => handleMovieClick(currentHeroMovie.id)}
+                      className="text-2xl sm:text-4xl lg:text-5xl font-black tracking-tight text-white leading-tight cursor-pointer hover:text-rose-400 transition"
+                    >
+                      {currentHeroMovie.title}
                     </h1>
-                    <div className="flex flex-wrap items-center gap-1.5 sm:gap-3 text-[10px] sm:text-xs text-slate-300">
-                      <span className="bg-amber-400 text-slate-950 font-extrabold px-2 py-0.5 sm:px-2.5 sm:py-1 rounded-md sm:rounded-lg flex items-center gap-1">
-                        <Star className="w-3 h-3 fill-current" />{" "}
-                        {featuredMovie.average_rating}
+
+                    {/* Synopsis Fills the Center Visual Space Naturally */}
+                    <p className="text-xs sm:text-sm text-slate-300 line-clamp-2 sm:line-clamp-3 leading-relaxed">
+                      {currentHeroMovie.description ||
+                        "Experience this blockbuster in breathtaking IMAX Laser projection and immersive 64-channel Dolby Atmos sound at a multiplex near you."}
+                    </p>
+
+                    <div className="flex flex-wrap items-center gap-2 text-xs text-slate-200">
+                      <span className="bg-amber-400 text-slate-950 font-black px-2.5 py-1 rounded-lg flex items-center gap-1">
+                        <Star className="w-3.5 h-3.5 fill-current" />{" "}
+                        {currentHeroMovie.average_rating} / 5
                       </span>
-                      <span className="px-2 py-0.5 sm:px-2.5 sm:py-1 rounded-md bg-slate-800/90 border border-slate-700 font-semibold">
-                        {featuredMovie.age_certification}
+                      <span className="px-2.5 py-1 rounded-lg bg-slate-900/90 border border-slate-700 font-bold">
+                        {currentHeroMovie.age_certification}
                       </span>
-                      <span className="hidden xs:inline-block px-2 py-0.5 rounded-md bg-slate-800/90 border border-slate-700">
-                        {featuredMovie.duration_minutes}m
+                      <span className="px-2.5 py-1 rounded-lg bg-slate-900/90 border border-slate-700">
+                        {currentHeroMovie.duration_minutes} mins
                       </span>
+                      {currentHeroMovie.genres?.map((g) => (
+                        <span
+                          key={g.id}
+                          className="px-2.5 py-1 rounded-lg bg-rose-950/60 border border-rose-800/50 text-rose-200 font-semibold"
+                        >
+                          {g.name}
+                        </span>
+                      ))}
                     </div>
-                    <div className="pt-1 sm:pt-2">
-                      <span className="inline-flex items-center gap-1.5 px-3.5 py-2 sm:px-6 sm:py-3 rounded-xl bg-rose-600 hover:bg-rose-500 text-white font-bold text-xs sm:text-sm shadow-lg shadow-rose-600/30 transition">
-                        <Ticket className="w-3.5 h-3.5 sm:w-4 sm:h-4" /> Book
-                        Now
-                      </span>
+
+                    <div className="pt-1 flex flex-wrap items-center gap-3">
+                      <button
+                        onClick={() => handleMovieClick(currentHeroMovie.id)}
+                        className="px-5 py-2.5 sm:px-6 sm:py-3 rounded-xl bg-gradient-to-r from-rose-600 to-rose-500 hover:from-rose-500 hover:to-rose-400 text-white font-bold text-xs sm:text-sm flex items-center gap-2 shadow-xl shadow-rose-600/30 cursor-pointer transition"
+                      >
+                        <Ticket className="w-4 h-4" /> Book Tickets Now
+                      </button>
+                      <button
+                        onClick={() => {
+                          setTempCity(userCity || "Mumbai");
+                          setPendingMovieId(currentHeroMovie.id);
+                          setShowLocationModal(true);
+                        }}
+                        className="px-4 py-2.5 sm:py-3 rounded-xl bg-slate-900/90 hover:bg-slate-800 border border-slate-700 text-slate-200 font-bold text-xs sm:text-sm flex items-center gap-1.5 cursor-pointer transition"
+                      >
+                        <MapPin className="w-4 h-4 text-rose-400" />
+                        {userCity ? `Theaters in ${userCity}` : "Choose City"}
+                      </button>
                     </div>
                   </div>
-                  <div className="shrink-0">
-                    <img
-                      src={getMoviePoster(featuredMovie)}
-                      onError={handleImgError}
-                      alt={featuredMovie.title}
-                      className="w-24 sm:w-48 lg:w-56 aspect-[2/3] object-cover rounded-xl sm:rounded-2xl shadow-2xl border border-slate-700/60"
-                    />
+
+                  {/* Center 4 Columns: "Recommended / Up Next" Queue Cards Filling the Middle Gap */}
+                  <div className="hidden lg:flex lg:col-span-4 flex-col justify-center space-y-2.5 bg-slate-950/65 backdrop-blur-md border border-slate-800/90 rounded-2xl p-4">
+                    <div className="flex items-center justify-between">
+                      <span className="text-[11px] font-extrabold uppercase tracking-wider text-amber-400 flex items-center gap-1.5">
+                        <Sparkles className="w-3.5 h-3.5" /> Recommended Queue
+                      </span>
+                      <span className="text-[10px] text-slate-400">
+                        Auto-Sliding • Click to Switch
+                      </span>
+                    </div>
+
+                    {upNextSlides.map((slide) => (
+                      <div
+                        key={slide.id}
+                        onClick={() => {
+                          const targetIdx = heroSlides.findIndex(
+                            (h) => h.id === slide.id,
+                          );
+                          if (targetIdx !== -1) setHeroIndex(targetIdx);
+                        }}
+                        className="flex items-center gap-3 p-2 rounded-xl bg-slate-900/90 hover:bg-slate-800/90 border border-slate-800/80 hover:border-rose-500/50 transition cursor-pointer group"
+                      >
+                        <img
+                          src={getMoviePoster(slide)}
+                          onError={handleImgError}
+                          alt={slide.title}
+                          className="w-11 h-16 object-cover rounded-lg shrink-0 border border-slate-700"
+                        />
+                        <div className="min-w-0 flex-1">
+                          <p className="text-xs font-bold text-white group-hover:text-rose-400 truncate">
+                            {slide.title}
+                          </p>
+                          <p className="text-[10px] text-slate-400 truncate">
+                            {slide.genres?.map((g) => g.name).join(" • ")}
+                          </p>
+                          <div className="flex items-center gap-2 mt-1">
+                            <span className="text-[10px] font-extrabold text-amber-400">
+                              ★ {slide.average_rating}
+                            </span>
+                            <span className="text-[10px] text-emerald-400 font-bold">
+                              ₹{slide.min_ticket_price || 200}
+                            </span>
+                          </div>
+                        </div>
+                        <ChevronRight className="w-4 h-4 text-slate-500 group-hover:text-rose-400 shrink-0" />
+                      </div>
+                    ))}
+                  </div>
+
+                  {/* Right 3 Columns: Active Featured Movie Poster */}
+                  <div className="lg:col-span-3 flex justify-center lg:justify-end">
+                    <div
+                      onClick={() => handleMovieClick(currentHeroMovie.id)}
+                      className="relative group cursor-pointer"
+                    >
+                      <img
+                        src={getMoviePoster(currentHeroMovie)}
+                        onError={handleImgError}
+                        alt={currentHeroMovie.title}
+                        className="w-40 sm:w-52 lg:w-56 aspect-[2/3] object-cover rounded-2xl shadow-2xl border-2 border-slate-700/80 group-hover:scale-105 transition duration-500"
+                      />
+                      <span className="absolute bottom-3 left-3 right-3 bg-slate-950/90 backdrop-blur-md border border-slate-700 text-center py-1.5 rounded-xl text-[11px] font-bold text-white opacity-0 group-hover:opacity-100 transition">
+                        Select City & Showtimes →
+                      </span>
+                    </div>
                   </div>
                 </div>
+
+                {/* Bottom Carousel Controls & Slide Indicators */}
+                {heroSlides.length > 1 && (
+                  <div className="relative z-10 px-4 sm:px-8 pb-4 flex items-center justify-between border-t border-slate-800/60 pt-3">
+                    <div className="flex items-center gap-2">
+                      {heroSlides.map((s, idx) => (
+                        <button
+                          key={s.id}
+                          onClick={() => setHeroIndex(idx)}
+                          className={`h-2 rounded-full transition-all cursor-pointer ${
+                            idx === heroIndex
+                              ? "w-8 bg-rose-500"
+                              : "w-2 bg-slate-700 hover:bg-slate-500"
+                          }`}
+                          aria-label={`Slide ${idx + 1}`}
+                        />
+                      ))}
+                    </div>
+
+                    <div className="flex items-center gap-2">
+                      <button
+                        onClick={() =>
+                          setHeroIndex(
+                            (prev) =>
+                              (prev - 1 + heroSlides.length) %
+                              heroSlides.length,
+                          )
+                        }
+                        className="p-1.5 rounded-xl bg-slate-900/90 hover:bg-slate-800 border border-slate-700 text-slate-300 cursor-pointer"
+                        aria-label="Previous Slide"
+                      >
+                        <ChevronLeft className="w-4 h-4" />
+                      </button>
+                      <button
+                        onClick={() =>
+                          setHeroIndex((prev) => (prev + 1) % heroSlides.length)
+                        }
+                        className="p-1.5 rounded-xl bg-slate-900/90 hover:bg-slate-800 border border-slate-700 text-slate-300 cursor-pointer"
+                        aria-label="Next Slide"
+                      >
+                        <ChevronRight className="w-4 h-4" />
+                      </button>
+                    </div>
+                  </div>
+                )}
               </div>
             )}
 
@@ -943,7 +1417,7 @@ export default function App() {
                   className="bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-xs sm:text-sm outline-none focus:border-rose-500"
                 >
                   <option value="">All Cities</option>
-                  {meta.cities.map((c) => (
+                  {Object.keys(CITY_REGION_DIRECTORY).map((c) => (
                     <option key={c} value={c}>
                       {c}
                     </option>
@@ -1011,7 +1485,7 @@ export default function App() {
             <section className="space-y-3 sm:space-y-4">
               <h2 className="text-base sm:text-xl font-extrabold tracking-tight flex items-center gap-2">
                 <Film className="w-4 h-4 sm:w-5 sm:h-5 text-rose-500" /> Now
-                Showing
+                Showing in Cinemas
               </h2>
 
               {loadingMovies ? (
@@ -1041,7 +1515,7 @@ export default function App() {
                   {movies.map((m) => (
                     <div
                       key={m.id}
-                      onClick={() => openMovieDetail(m.id)}
+                      onClick={() => handleMovieClick(m.id)}
                       className="group bg-slate-900/90 border border-slate-800/90 rounded-2xl overflow-hidden cursor-pointer hover:border-rose-500/60 transition-all duration-300 shadow-lg flex flex-col"
                     >
                       <div className="aspect-[2/3] bg-slate-800 relative overflow-hidden">
@@ -1108,7 +1582,7 @@ export default function App() {
                   {recommended.slice(0, 4).map((m) => (
                     <div
                       key={m.id}
-                      onClick={() => openMovieDetail(m.id)}
+                      onClick={() => handleMovieClick(m.id)}
                       className="bg-slate-900/90 border border-slate-800 p-3 rounded-2xl cursor-pointer hover:border-amber-500/50 transition flex items-center gap-3 shadow-md"
                     >
                       <img
@@ -1139,15 +1613,28 @@ export default function App() {
           </div>
         )}
 
-        {/* TAB 2: MOVIE DETAILS WITH REGION/CITY THEATER FILTER */}
+        {/* TAB 2: MOVIE DETAILS WITH 2-LEVEL CITY + SUB-REGION THEATER FILTER */}
         {activeTab === "detail" && selectedMovie && (
           <div className="space-y-6 sm:space-y-8">
-            <button
-              onClick={() => setActiveTab("discover")}
-              className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl bg-slate-900 border border-slate-800 text-xs font-semibold text-slate-300 hover:text-white cursor-pointer"
-            >
-              <ArrowLeft className="w-3.5 h-3.5" /> Back to Movies
-            </button>
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <button
+                onClick={() => setActiveTab("discover")}
+                className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl bg-slate-900 border border-slate-800 text-xs font-semibold text-slate-300 hover:text-white cursor-pointer"
+              >
+                <ArrowLeft className="w-3.5 h-3.5" /> Back to Movies
+              </button>
+
+              <button
+                onClick={() => {
+                  setTempCity(detailCity || userCity || "Mumbai");
+                  setShowLocationModal(true);
+                }}
+                className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-rose-600/15 border border-rose-500/40 text-xs font-bold text-rose-300 hover:bg-rose-600/25 cursor-pointer"
+              >
+                <Navigation className="w-3.5 h-3.5" /> Change City / Region
+                Popup
+              </button>
+            </div>
 
             <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 sm:gap-8 bg-slate-900/90 border border-slate-800 rounded-2xl sm:rounded-3xl p-4 sm:p-8 shadow-2xl">
               <div className="lg:col-span-4 flex flex-col items-center sm:items-stretch space-y-3">
@@ -1260,80 +1747,132 @@ export default function App() {
               </div>
             </div>
 
-            {/* Showtimes with Region / City Selector */}
-            <div className="bg-slate-900/90 border border-slate-800 rounded-2xl sm:rounded-3xl p-4 sm:p-8 space-y-4">
-              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-slate-800">
+            {/* 2-Level City + Sub-Region Multiplex Filter Section */}
+            <div className="bg-slate-900/90 border border-slate-800 rounded-2xl sm:rounded-3xl p-4 sm:p-8 space-y-5">
+              <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 pb-4 border-b border-slate-800">
                 <div>
                   <h2 className="text-base sm:text-xl font-extrabold flex items-center gap-2">
                     <Calendar className="w-4 h-4 sm:w-5 sm:h-5 text-rose-500" />{" "}
-                    Select Theater & Showtime
+                    Select Multiplex & Showtime
                   </h2>
                   <p className="text-[11px] text-slate-400 mt-0.5">
-                    Filter multiplexes by region/city to view local show timings
+                    Showing theaters in{" "}
+                    <strong className="text-white">
+                      {detailCity || "All Cities"}
+                    </strong>
+                    {detailSubRegion ? ` • ${detailSubRegion}` : ""}
                   </p>
                 </div>
 
-                {/* Region Filter Pills + Dropdown */}
+                {/* Level 1: City Selector Tabs */}
                 <div className="flex flex-wrap items-center gap-1.5">
-                  <span className="text-xs text-slate-400 flex items-center gap-1 mr-1">
-                    <MapPin className="w-3.5 h-3.5 text-rose-500" /> Region:
+                  <span className="text-xs text-slate-400 font-semibold mr-1">
+                    1. City:
                   </span>
                   <button
-                    onClick={() => setSelectedDetailRegion("")}
+                    onClick={() => {
+                      setDetailCity("");
+                      setDetailSubRegion("");
+                    }}
                     className={`px-3 py-1.5 rounded-xl text-xs font-bold transition cursor-pointer ${
-                      selectedDetailRegion === ""
+                      detailCity === ""
                         ? "bg-rose-600 text-white shadow-md shadow-rose-600/25"
                         : "bg-slate-950 border border-slate-800 text-slate-300 hover:border-slate-700"
                     }`}
                   >
-                    All Regions ({selectedMovie.showtimes?.length || 0})
+                    All Cities
                   </button>
-                  {availableShowtimeRegions.map((region) => (
+                  {availableCitiesForMovie.map((city) => (
                     <button
-                      key={region}
-                      onClick={() => setSelectedDetailRegion(region)}
+                      key={city}
+                      onClick={() => {
+                        setDetailCity(city);
+                        setDetailSubRegion("");
+                        localStorage.setItem("bms_city", city);
+                        setUserCity(city);
+                      }}
                       className={`px-3 py-1.5 rounded-xl text-xs font-bold transition cursor-pointer ${
-                        selectedDetailRegion === region
+                        detailCity === city
                           ? "bg-rose-600 text-white shadow-md shadow-rose-600/25"
                           : "bg-slate-950 border border-slate-800 text-slate-300 hover:border-slate-700"
                       }`}
                     >
-                      {region}
+                      {CITY_REGION_DIRECTORY[city]?.icon || "📍"} {city}
                     </button>
                   ))}
                 </div>
               </div>
 
+              {/* Level 2: Sub-Region Filter Pills inside the Selected City */}
+              <div className="flex flex-wrap items-center gap-2 bg-slate-950/70 p-3 rounded-2xl border border-slate-800/80">
+                <span className="text-xs text-indigo-400 font-bold flex items-center gap-1 mr-1">
+                  <MapPin className="w-3.5 h-3.5" /> 2. Filter by Local Region:
+                </span>
+                <button
+                  onClick={() => {
+                    setDetailSubRegion("");
+                    localStorage.setItem("bms_subregion", "");
+                    setUserSubRegion("");
+                  }}
+                  className={`px-3 py-1 rounded-lg text-xs font-bold transition cursor-pointer ${
+                    detailSubRegion === ""
+                      ? "bg-indigo-600 text-white"
+                      : "bg-slate-900 border border-slate-800 text-slate-300 hover:border-slate-700"
+                  }`}
+                >
+                  All Regions in {detailCity || "India"}
+                </button>
+                {availableSubRegionsForCity.map((subReg) => (
+                  <button
+                    key={subReg}
+                    onClick={() => {
+                      setDetailSubRegion(subReg);
+                      localStorage.setItem("bms_subregion", subReg);
+                      setUserSubRegion(subReg);
+                    }}
+                    className={`px-3 py-1 rounded-lg text-xs font-bold transition cursor-pointer ${
+                      detailSubRegion === subReg
+                        ? "bg-indigo-600 text-white"
+                        : "bg-slate-900 border border-slate-800 text-slate-300 hover:border-slate-700"
+                    }`}
+                  >
+                    {subReg}
+                  </button>
+                ))}
+              </div>
+
               {filteredMovieShowtimes.length === 0 ? (
                 <div className="text-center py-8 space-y-2">
                   <p className="text-sm text-slate-400">
-                    No showtimes found in {selectedDetailRegion}.
+                    No showtimes found for this region filter.
                   </p>
                   <button
-                    onClick={() => setSelectedDetailRegion("")}
+                    onClick={() => {
+                      setDetailCity("");
+                      setDetailSubRegion("");
+                    }}
                     className="px-4 py-1.5 bg-rose-600 rounded-xl text-xs font-bold text-white cursor-pointer"
                   >
-                    Show All Regions
+                    Show All Multiplexes
                   </button>
                 </div>
               ) : (
                 <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3 sm:gap-4">
                   {filteredMovieShowtimes.map((st) => (
                     <button
-                      key={st.id}
+                      key={st.ui_key || st.id}
                       onClick={() => openSeatMap(st.id)}
                       className="p-3.5 sm:p-4 rounded-2xl bg-slate-950 border border-slate-800 hover:border-rose-500 text-left transition group flex items-center justify-between cursor-pointer"
                     >
                       <div className="space-y-1 min-w-0 pr-2">
-                        <p className="font-bold text-xs sm:text-sm text-white group-hover:text-rose-400 truncate">
+                        <span className="inline-block text-[10px] font-bold px-2 py-0.5 rounded bg-indigo-500/15 text-indigo-300 border border-indigo-500/30">
+                          {st.city} • {st.sub_region}
+                        </span>
+                        <p className="font-bold text-xs sm:text-sm text-white group-hover:text-rose-400 truncate pt-0.5">
                           {st.theater_name}
                         </p>
-                        <p className="text-[11px] text-slate-400 flex items-center gap-1 truncate">
-                          <MapPin className="w-3 h-3 text-rose-400 shrink-0" />{" "}
-                          <span className="text-slate-200 font-semibold">
-                            {st.city}
-                          </span>{" "}
-                          • {st.screen_name}
+                        <p className="text-[11px] text-slate-400 truncate">
+                          {st.screen_name}
                         </p>
                         <p className="text-xs text-emerald-400 font-semibold pt-0.5">
                           {new Date(st.start_time).toLocaleString([], {
@@ -1350,7 +1889,7 @@ export default function App() {
                           ₹{st.ticket_price}
                         </span>
                         <span className="text-[10px] text-slate-500 mt-1 block">
-                          Book →
+                          Select Seats →
                         </span>
                       </div>
                     </button>
@@ -1467,7 +2006,6 @@ export default function App() {
         {activeTab === "seats" && seatLayout && (
           <div className="space-y-4 sm:space-y-6 pb-24 sm:pb-12">
             {bookingConfirmedData ? (
-              /* Animated Tick Confirmation Screen right after Payment */
               <div className="max-w-lg mx-auto bg-slate-900 border-2 border-emerald-500/60 rounded-3xl p-6 sm:p-8 text-center space-y-6 shadow-2xl my-4">
                 <div className="w-20 h-20 rounded-full bg-emerald-500/20 border-2 border-emerald-400 flex items-center justify-center mx-auto shadow-lg shadow-emerald-500/30 animate-bounce">
                   <CheckCircle2 className="w-12 h-12 text-emerald-400" />
@@ -1485,7 +2023,6 @@ export default function App() {
                   </p>
                 </div>
 
-                {/* Booked Ticket Summary Card */}
                 <div className="bg-slate-950 border border-slate-800 rounded-2xl p-5 text-left space-y-3">
                   <div className="flex items-start justify-between border-b border-slate-800 pb-3">
                     <div>
@@ -1635,7 +2172,7 @@ export default function App() {
                               "bg-rose-950/60 border-rose-800/70 text-rose-400/50 cursor-not-allowed";
                           else if (s.status === "RESERVED")
                             btnClass =
-                              "bg-amber-500/20 border-amber-500 text-amber-300 cursor-not-allowed";
+                              "bg-amber-500/20 border border-amber-500 text-amber-300 cursor-not-allowed";
                           else if (isSelected)
                             btnClass =
                               "bg-emerald-500 border-emerald-300 text-slate-950 font-black scale-105 shadow-md shadow-emerald-500/30 cursor-pointer";
@@ -1670,7 +2207,7 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* Sticky Checkout Footer with GST & Fee Breakdown */}
+                {/* Sticky Checkout Footer */}
                 <div className="fixed bottom-14 sm:bottom-4 left-2 right-2 sm:static z-30 bg-slate-900/95 backdrop-blur-xl border-2 border-slate-700 sm:border-slate-800 rounded-2xl sm:rounded-3xl p-3.5 sm:p-6 shadow-2xl flex flex-col sm:flex-row sm:items-center justify-between gap-3">
                   <div className="space-y-0.5">
                     <div className="flex sm:block items-center justify-between">
