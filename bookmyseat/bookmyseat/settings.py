@@ -7,7 +7,6 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 
 IS_PRODUCTION = bool(os.environ.get("RENDER") or os.environ.get("DATABASE_URL"))
 
-# Uses SECRET_KEY from environment, or safely derives a deterministic key so Render builds never crash
 SECRET_KEY = os.environ.get(
     "SECRET_KEY",
     hashlib.sha256(f"bookmyseat-prod-{os.environ.get('RENDER_SERVICE_ID', 'default-2026')}".encode()).hexdigest(),
@@ -133,7 +132,7 @@ CSRF_TRUSTED_ORIGINS = [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
     "https://*.vercel.app",
-    "https://*.onrender\.com",
+    "https://*.onrender.com",
 ]
 
 RAZORPAY_KEY_ID = os.environ.get("RAZORPAY_KEY_ID", "rzp_test_bookmyseat_key")
